@@ -11,6 +11,7 @@
 //!   what keeps a wedged callback from freezing the keyboard.
 
 mod convert;
+mod pairing;
 mod suppress;
 
 use std::ffi::c_void;
@@ -34,6 +35,7 @@ use crate::keycode::{self, Keycode};
 use crate::{KeyEvent, KeyEventKind, Modifiers};
 
 use convert::{ModifierTracker, RawKind};
+use pairing::{Pairing, Plan};
 use suppress::{Action, Suppression};
 
 /// Keyboard-only mask: mouse/scroll/gesture events never route through the tap,
@@ -171,13 +173,31 @@ impl TapThread {
         let _ = self.cmd.send(TapCommand::Teardown);
     }
 
-    /// Shut the thread down, waiting for a clean exit.
+    /// Shut the thread down. If the thread is stuck (e.g. inside a misbehaving
+    /// user callback), detach instead of hanging forever — the supervisor has
+    /// already force-invalidated the tap, so the stuck thread is inert.
     pub(crate) fn shutdown(mut self) {
         let _ = self.cmd.send(TapCommand::Shutdown);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            join_with_timeout(join, Duration::from_secs(2), "tap");
         }
     }
+}
+
+/// Join a thread, but detach instead of hanging forever if it is stuck
+/// (e.g. the tap thread blocked inside a misbehaving user callback).
+pub(crate) fn join_with_timeout(join: JoinHandle<()>, timeout: Duration, name: &str) {
+    let start = Instant::now();
+    while !join.is_finished() {
+        if start.elapsed() > timeout {
+            log::warn!(
+                "keyvent: {name} thread did not exit in time; detached (tap already invalidated)"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = join.join();
 }
 
 /// Everything the tap callback needs, living on the tap thread's stack.
@@ -187,6 +207,7 @@ struct Ctx {
     callback: Box<dyn FnMut(KeyEvent) -> bool + Send>,
     tracker: ModifierTracker,
     suppression: Suppression,
+    pairing: Pairing,
     tap: Option<CFRetained<CFMachPort>>,
     source: Option<CFRetained<CFRunLoopSource>>,
     hb_next: Instant,
@@ -203,6 +224,7 @@ fn thread_main(
         callback,
         tracker: ModifierTracker::default(),
         suppression: Suppression::default(),
+        pairing: Pairing::default(),
         tap: None,
         source: None,
         hb_next: Instant::now(),
@@ -288,14 +310,25 @@ fn install(ctx: &mut Ctx) -> bool {
     ctx.tap = Some(tap);
     ctx.source = Some(source);
     ctx.hb_next = Instant::now();
+    // Initialize modifier tracking from physical truth, so keys held while the
+    // stream starts are tracked correctly instead of guessed later.
+    ctx.tracker
+        .init_from_physical(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
     log::info!("keyvent: event tap installed");
     true
 }
 
 /// Full teardown: remove from run loop, disable, invalidate. Safe to call with
-/// no tap installed.
+/// no tap installed. Closing the stream means every unclosed consumer-side
+/// press is completed with a synthetic release.
 fn teardown(ctx: &mut Ctx) {
-    reconcile_suppression(ctx);
+    // OS-side book: drop entries whose key is physically up so a later rebuild
+    // doesn't force-swallow releases for presses the OS actually saw.
+    ctx.suppression
+        .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
+    // Consumer-side ledger: the stream ends here, close everything.
+    let dangling = ctx.pairing.close_all();
+    emit_synthetic_releases(ctx, dangling);
     drop_local_tap(ctx);
     ctx.shared.handle.lock().unwrap().take();
 }
@@ -313,13 +346,20 @@ fn drop_local_tap(ctx: &mut Ctx) {
     }
 }
 
-/// Compare the suppression book against physical key state; emit synthetic
-/// releases to the consumer for swallowed presses whose key is actually up.
-fn reconcile_suppression(ctx: &mut Ctx) {
-    let released = ctx
-        .suppression
+/// Recovery reconcile after a tap-disabled event (timeout / userInput): the
+/// stream continues, so only presses whose key is physically up are closed —
+/// keys still held stay open and close on their real release.
+fn reconcile_books(ctx: &mut Ctx) {
+    ctx.suppression
         .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
-    for code in released {
+    let released = ctx
+        .pairing
+        .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
+    emit_synthetic_releases(ctx, released);
+}
+
+fn emit_synthetic_releases(ctx: &mut Ctx, codes: Vec<Keycode>) {
+    for code in codes {
         let event = KeyEvent {
             key: keycode::key_from_code(code),
             kind: KeyEventKind::Release,
@@ -411,7 +451,7 @@ unsafe extern "C-unwind" fn raw_callback(
     // Tap-disabled housekeeping events.
     if event_type == CGEventType::TapDisabledByTimeout {
         ctx.shared.timeouts.fetch_add(1, SeqCst);
-        reconcile_suppression(ctx);
+        reconcile_books(ctx);
         if let Some(tap) = &ctx.tap {
             CGEvent::tap_enable(tap, true);
         }
@@ -420,9 +460,8 @@ unsafe extern "C-unwind" fn raw_callback(
     }
     if event_type == CGEventType::TapDisabledByUserInput {
         // Never re-enable on this path (it may mean permission loss). The
-        // supervisor decides what to do.
+        // supervisor decides what to do (teardown closes the stream).
         ctx.shared.user_input_disabled.store(true, SeqCst);
-        reconcile_suppression(ctx);
         log::warn!("keyvent: tap disabled by user input");
         return event.as_ptr();
     }
@@ -448,16 +487,43 @@ unsafe extern "C-unwind" fn raw_callback(
     let snapshot = modifiers_from_cg(CGEvent::flags(Some(cg)));
 
     let key_event = convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind);
-    let user_swallow = dispatch(ctx, key_event);
 
+    // Consumer side: pairing ledger decides what the callback may see.
+    // OS side: suppression bookkeeping decides what happens to the raw event.
+    // The two ledgers are independent — e.g. an orphan release is hidden from
+    // the consumer but still passed through to the OS if the OS saw its press.
     match key_event.kind {
-        KeyEventKind::Press => match ctx.suppression.press(keycode, user_swallow) {
-            Action::Swallow => null_mut(),
-            Action::Pass => event.as_ptr(),
-        },
-        KeyEventKind::Release => match ctx.suppression.release(keycode, user_swallow) {
-            Action::Swallow => null_mut(),
-            Action::Pass => event.as_ptr(),
-        },
+        KeyEventKind::Press => {
+            if ctx.pairing.press(keycode, is_repeat) == Plan::CloseThenDeliver {
+                // A previous release was lost: close the dangling press first.
+                dispatch(ctx, synthetic_release(keycode));
+            }
+            let user_swallow = dispatch(ctx, key_event);
+            match ctx.suppression.press(keycode, user_swallow) {
+                Action::Swallow => null_mut(),
+                Action::Pass => event.as_ptr(),
+            }
+        }
+        KeyEventKind::Release => {
+            let deliver = ctx.pairing.release(keycode) == Plan::Deliver;
+            let user_swallow = if deliver {
+                dispatch(ctx, key_event)
+            } else {
+                false
+            };
+            match ctx.suppression.release(keycode, user_swallow) {
+                Action::Swallow => null_mut(),
+                Action::Pass => event.as_ptr(),
+            }
+        }
+    }
+}
+
+fn synthetic_release(code: Keycode) -> KeyEvent {
+    KeyEvent {
+        key: keycode::key_from_code(code),
+        kind: KeyEventKind::Release,
+        modifiers: current_modifier_snapshot(),
+        is_repeat: false,
     }
 }

@@ -34,8 +34,13 @@ pub(crate) struct Suppression {
 
 impl Suppression {
     /// Book a press. `user_swallow` is the callback's decision.
+    ///
+    /// While a press of this key is being swallowed, ALL its subsequent down
+    /// events (key repeats, or a re-press after a lost release) are swallowed
+    /// too — otherwise the OS would see repeated KeyDowns for a press it never
+    /// witnessed.
     pub(crate) fn press(&mut self, code: Keycode, user_swallow: bool) -> Action {
-        if user_swallow {
+        if user_swallow || self.swallowed_presses.contains(&code) {
             self.swallowed_presses.insert(code);
             Action::Swallow
         } else {
@@ -98,6 +103,18 @@ mod tests {
         // Callback may still swallow a release of a passed press (its choice).
         assert_eq!(s.press(36, false), Action::Pass);
         assert_eq!(s.release(36, true), Action::Swallow);
+    }
+
+    #[test]
+    fn repeat_during_swallowed_press_is_swallowed() {
+        let mut s = Suppression::default();
+        assert_eq!(s.press(36, true), Action::Swallow);
+        // Callback passes the key-repeat downs; bookkeeping still swallows them.
+        assert_eq!(s.press(36, false), Action::Swallow);
+        assert_eq!(s.press(36, false), Action::Swallow);
+        assert_eq!(s.release(36, false), Action::Swallow);
+        // After the release, the key is back to normal.
+        assert_eq!(s.press(36, false), Action::Pass);
     }
 
     #[test]

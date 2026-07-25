@@ -71,17 +71,25 @@ impl ModifierTracker {
             Key::CapsLock => press_if(snapshot.contains(Modifiers::CAPS_LOCK)),
             Key::Function => press_if(snapshot.contains(Modifiers::FN)),
             _ => match side_of(key) {
-                Some((side, _)) => {
-                    // Toggle inference: a FlagsChanged for this key flips its tracked
-                    // state. Correct even with both sides held, as long as no event
-                    // was lost; reconcile() repairs drift on every other event.
-                    let was_held = self.held.contains(side);
-                    if was_held {
+                Some((side, group)) => {
+                    // FlagsChanged carries POST-change flags, so a clear aggregate
+                    // bit is deterministic: no key of this group is held anymore,
+                    // therefore this change was a release — even if our tracked
+                    // state disagrees (missed press). Only a *set* aggregate is
+                    // ambiguous (press, or release with the other side still held),
+                    // and only there do we need toggle inference.
+                    if !snapshot.contains(group) {
                         self.held.remove(side);
+                        KeyEventKind::Release
                     } else {
-                        self.held.insert(side);
+                        let was_held = self.held.contains(side);
+                        if was_held {
+                            self.held.remove(side);
+                        } else {
+                            self.held.insert(side);
+                        }
+                        press_if(!was_held)
                     }
-                    press_if(!was_held)
                 }
                 None => {
                     // Unknown keycode arriving as FlagsChanged: nothing sensible to
@@ -90,15 +98,39 @@ impl ModifierTracker {
                 }
             },
         };
-        // Reconcile the *other* groups against the snapshot (this event's own
-        // group is mid-transition, its aggregate is not settled).
-        let skip = side_of(key).map(|(_, group)| group);
-        self.reconcile(snapshot, skip);
+        // Reconcile all groups against the snapshot. Post-change flags make this
+        // safe for the changed group too, and it clears phantom tracked state
+        // (e.g. from a missed press) in the same event instead of the next one.
+        self.reconcile(snapshot, None);
         KeyEvent {
             key,
             kind,
             modifiers: snapshot,
             is_repeat: false,
+        }
+    }
+
+    /// Initialize tracked state from physical key state (at tap install time,
+    /// so keys held while the stream starts are tracked truthfully instead of
+    /// being guessed later by reconcile's assume-left fallback).
+    pub(crate) fn init_from_physical(&mut self, is_held: impl Fn(Keycode) -> bool) {
+        self.held = SideState::default();
+        const SIDE_KEYS: [(Key, SideState); 8] = [
+            (Key::ShiftLeft, SideState::SHIFT_L),
+            (Key::ShiftRight, SideState::SHIFT_R),
+            (Key::ControlLeft, SideState::CONTROL_L),
+            (Key::ControlRight, SideState::CONTROL_R),
+            (Key::OptionLeft, SideState::OPTION_L),
+            (Key::OptionRight, SideState::OPTION_R),
+            (Key::CommandLeft, SideState::COMMAND_L),
+            (Key::CommandRight, SideState::COMMAND_R),
+        ];
+        for (key, side) in SIDE_KEYS {
+            if let Some(code) = keycode::code_from_key(key)
+                && is_held(code)
+            {
+                self.held.insert(side);
+            }
         }
     }
 
@@ -251,10 +283,27 @@ mod tests {
         // First event ever seen already has COMMAND held: press was missed.
         let e = convert(0, false, Modifiers::COMMAND, &mut t, RawKind::Down);
         assert_eq!(e.modifiers, Modifiers::COMMAND);
-        // CommandRight release arrives (aggregate clears): inferred as Release,
-        // and tracker must not go negative.
+        // CommandRight release arrives with the aggregate CLEAR: the aggregate
+        // rule determines this is a release (never a toggle-mislabeled press),
+        // and the same event's reconcile clears the phantom CommandLeft that
+        // assume-left had inserted. Tracker must not go negative or leak state.
         let e = convert(54, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.key, Key::CommandRight);
+        assert_eq!(e.kind, KeyEventKind::Release);
+        // Phantom state is gone: a subsequent CommandLeft FlagsChanged with the
+        // aggregate set is inferred as a fresh press.
+        let e = convert(55, false, Modifiers::COMMAND, &mut t, RawKind::FlagsChanged);
+        assert_eq!(e.kind, KeyEventKind::Press);
+    }
+
+    #[test]
+    fn aggregate_clear_release_rule_heals_missed_press() {
+        let mut t = ModifierTracker::default();
+        // Tap installed while CommandLeft was held; its press is in the blind
+        // zone. No assume-left has fired yet (no plain event seen).
+        // The user releases it: aggregate clears -> deterministic Release.
+        let e = convert(55, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
+        assert_eq!(e, ev(Key::CommandLeft, KeyEventKind::Release, Modifiers::NONE));
     }
 
     #[test]
