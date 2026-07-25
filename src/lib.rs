@@ -37,8 +37,8 @@ mod supervisor;
 mod tap;
 
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicU8};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU8;
+use std::sync::{mpsc, Arc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
 
@@ -69,7 +69,7 @@ impl Status {
 /// the tap is invalidated, both threads exit, no state leaks.
 pub struct Guard {
     status: Arc<AtomicU8>,
-    status_cb: Arc<Mutex<Option<supervisor::StatusCallback>>>,
+    status_rx: mpsc::Receiver<Status>,
     supervisor: Option<supervisor::Supervisor>,
 }
 
@@ -83,16 +83,13 @@ pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
     let shared = Arc::new(tap::TapShared::new());
     let tap = tap::TapThread::spawn(Box::new(callback), shared.clone());
     let status = Arc::new(AtomicU8::new(Status::Silent as u8));
-    let status_cb: Arc<Mutex<Option<supervisor::StatusCallback>>> = Arc::new(Mutex::new(None));
-    let supervisor = supervisor::Supervisor::spawn(
-        tap,
-        shared,
-        status.clone(),
-        status_cb.clone(),
-    );
+    // Bounded: if nobody drains the channel, new statuses are dropped rather
+    // than queueing forever — `Guard::status()` always has the current value.
+    let (status_tx, status_rx) = mpsc::sync_channel(16);
+    let supervisor = supervisor::Supervisor::spawn(tap, shared, status.clone(), status_tx);
     Guard {
         status,
-        status_cb,
+        status_rx,
         supervisor: Some(supervisor),
     }
 }
@@ -103,14 +100,11 @@ impl Guard {
         Status::from_u8(self.status.load(SeqCst))
     }
 
-    /// Subscribe to status changes. The callback is invoked with the current
-    /// status immediately upon registration (so no transition between `start`
-    /// and registration is lost), and then on every change from the supervisor
-    /// thread. Keep it cheap (e.g. send to a channel).
-    pub fn on_status_change(&self, f: impl Fn(Status) + Send + Sync + 'static) {
-        let cb: supervisor::StatusCallback = Arc::new(f);
-        *self.status_cb.lock().unwrap() = Some(cb.clone());
-        cb(self.status());
+    /// Stream of status changes. Events emitted between `start` and the first
+    /// read are retained in the channel. Use `recv` to block for the next
+    /// change or `try_recv` to poll.
+    pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
+        &self.status_rx
     }
 }
 

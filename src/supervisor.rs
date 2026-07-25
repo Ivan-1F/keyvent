@@ -15,7 +15,7 @@
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -98,11 +98,6 @@ enum State {
     },
 }
 
-/// Shared handle for the status-change callback. Kept behind an Arc so the
-/// supervisor can clone it out of the lock and invoke it lock-free (a callback
-/// that re-enters `Guard::on_status_change` must not deadlock).
-pub(crate) type StatusCallback = Arc<dyn Fn(Status) + Send + Sync>;
-
 pub(crate) struct Supervisor {
     shutdown: Arc<AtomicBool>,
     shared: Arc<TapShared>,
@@ -114,14 +109,14 @@ impl Supervisor {
         tap: TapThread,
         shared: Arc<TapShared>,
         status: Arc<AtomicU8>,
-        status_cb: Arc<Mutex<Option<StatusCallback>>>,
+        status_tx: mpsc::SyncSender<Status>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
         let shared2 = shared.clone();
         let join = thread::Builder::new()
             .name("keyvent-supervisor".into())
-            .spawn(move || supervise(tap, shared, status, status_cb, shutdown2))
+            .spawn(move || supervise(tap, shared, status, status_tx, shutdown2))
             .expect("spawn keyvent-supervisor thread");
         Self {
             shutdown,
@@ -141,9 +136,12 @@ impl Supervisor {
     }
 }
 
+/// Record a status transition: update the atomic current-value cell and queue
+/// the change for subscribers. A full channel drops the change silently —
+/// `Guard::status()` always reflects the latest state regardless.
 fn announce(
     status: &Arc<AtomicU8>,
-    status_cb: &Arc<Mutex<Option<StatusCallback>>>,
+    status_tx: &mpsc::SyncSender<Status>,
     current: &mut Status,
     next: Status,
 ) {
@@ -153,11 +151,7 @@ fn announce(
     log::info!("keyvent: status {current:?} -> {next:?}");
     *current = next;
     status.store(next as u8, SeqCst);
-    // Clone the Arc out of the lock, then invoke lock-free.
-    let cb = status_cb.lock().unwrap().clone();
-    if let Some(cb) = cb {
-        cb(next);
-    }
+    let _ = status_tx.try_send(next);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,7 +159,7 @@ fn supervise(
     tap: TapThread,
     shared: Arc<TapShared>,
     status: Arc<AtomicU8>,
-    status_cb: Arc<Mutex<Option<StatusCallback>>>,
+    status_tx: mpsc::SyncSender<Status>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut state = State::Silent;
@@ -173,7 +167,7 @@ fn supervise(
     let mut probe_due = Instant::now(); // probe immediately on start
     let mut cycles = 0u32;
 
-    announce(&status, &status_cb, &mut current_status, Status::Silent);
+    announce(&status, &status_tx, &mut current_status, Status::Silent);
 
     while !shutdown.load(SeqCst) {
         std::thread::sleep(TICK);
@@ -191,10 +185,10 @@ fn supervise(
                 if probed == Some(true) && tap.install() {
                     cycles = 0;
                     state = State::Running;
-                    announce(&status, &status_cb, &mut current_status, Status::Running);
+                    announce(&status, &status_tx, &mut current_status, Status::Running);
                     continue;
                 }
-                announce(&status, &status_cb, &mut current_status, Status::Silent);
+                announce(&status, &status_tx, &mut current_status, Status::Silent);
             }
 
             State::Running => {
@@ -239,7 +233,7 @@ fn supervise(
                         tap.teardown();
                         cycles = 0;
                         state = State::Silent;
-                        announce(&status, &status_cb, &mut current_status, Status::Silent);
+                        announce(&status, &status_tx, &mut current_status, Status::Silent);
                     }
                     Some(true) => {
                         if secure_input_active() {
@@ -261,7 +255,7 @@ fn supervise(
                                     state = State::Cooldown {
                                         until: now + COOLDOWN_DURATION,
                                     };
-                                    announce(&status, &status_cb, &mut current_status, Status::Cooldown);
+                                    announce(&status, &status_tx, &mut current_status, Status::Cooldown);
                                 }
                             }
                         } else if entered.elapsed() > SUSPICION_GRACE {
@@ -272,7 +266,7 @@ fn supervise(
                                 state = State::Cooldown {
                                     until: now + COOLDOWN_DURATION,
                                 };
-                                announce(&status, &status_cb, &mut current_status, Status::Cooldown);
+                                announce(&status, &status_tx, &mut current_status, Status::Cooldown);
                             } else {
                                 *rebuilt = false;
                                 *entered = now;
@@ -291,7 +285,7 @@ fn supervise(
                     log::info!("keyvent: cooldown over; resuming normal operation");
                     cycles = 0;
                     state = State::Silent;
-                    announce(&status, &status_cb, &mut current_status, Status::Silent);
+                    announce(&status, &status_tx, &mut current_status, Status::Silent);
                 }
             }
         }

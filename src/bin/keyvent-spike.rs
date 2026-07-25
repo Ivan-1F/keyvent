@@ -97,11 +97,16 @@ fn watch(verbose: bool, swallow_key: Option<Key>) -> ! {
         swallow_key == Some(event.key)
     });
 
-    guard.on_status_change(|status| {
-        log::info!("=== STATUS {} ===", status_name(status));
+    std::thread::spawn(move || {
+        let rx = guard.status_receiver();
+        while let Ok(status) = rx.recv() {
+            log::info!("=== STATUS {} ===", status_name(status));
+        }
+        // Sender dropped (shutdown); keep the guard alive on this thread.
+        std::thread::park();
     });
 
-    log::info!("keyvent started; current status = {}", status_name(guard.status()));
+    log::info!("keyvent started");
     std::thread::park();
     unreachable!();
 }
