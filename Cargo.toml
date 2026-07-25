@@ -2,6 +2,16 @@
 name = "keyvent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Global keyboard event stream for macOS, with automatic Accessibility permission lifecycle management"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ivan-1F/keyvent"
+keywords = ["hotkey", "keyboard", "macos", "event-tap", "global"]
+categories = ["os::macos-apis", "api-bindings"]
+exclude = ["src/bin/", "scripts/", "docs/", "target/"]
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 
 [dependencies]
 log = "0.4"
