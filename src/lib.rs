@@ -18,11 +18,12 @@
 //!
 //! The callback runs on the event-tap thread, on the critical path of every
 //! keystroke in the session. It **must return quickly**: no blocking, no
-//! locking contended mutexes, no synchronous cross-thread calls. A callback
-//! that stalls gets the tap killed by the OS watchdog (keyboard input stalls
-//! for ~1s per event until then) and keyvent will tear the tap down — but the
-//! contract is what keeps that from ever happening. Do slow work on your own
-//! thread: send the event over a channel and decide quickly.
+//! locking contended mutexes, no synchronous cross-thread calls. If it stalls
+//! anyway, the OS watchdog disables the tap (keyboard input hesitates for up
+//! to ~1s per event, then flows again), and keyvent's supervisor notices the
+//! broken heartbeat and tears the tap down for good measure. The contract is
+//! what keeps any of that from ever happening: do slow work on your own
+//! thread — send the event over a channel and decide quickly.
 
 mod event;
 mod keycode;
@@ -62,7 +63,7 @@ impl Status {
 /// the tap is invalidated, both threads exit, no state leaks.
 pub struct Guard {
     status: Arc<AtomicU8>,
-    status_cb: Arc<Mutex<Option<Box<dyn Fn(Status) + Send>>>>,
+    status_cb: Arc<Mutex<Option<supervisor::StatusCallback>>>,
     supervisor: Option<supervisor::Supervisor>,
 }
 
@@ -76,7 +77,7 @@ pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
     let shared = Arc::new(tap::TapShared::new());
     let tap = tap::TapThread::spawn(Box::new(callback), shared.clone());
     let status = Arc::new(AtomicU8::new(Status::Silent as u8));
-    let status_cb: Arc<Mutex<Option<Box<dyn Fn(Status) + Send>>>> = Arc::new(Mutex::new(None));
+    let status_cb: Arc<Mutex<Option<supervisor::StatusCallback>>> = Arc::new(Mutex::new(None));
     let supervisor = supervisor::Supervisor::spawn(
         tap,
         shared,
@@ -96,10 +97,14 @@ impl Guard {
         Status::from_u8(self.status.load(SeqCst))
     }
 
-    /// Subscribe to status changes. The callback runs on the supervisor thread;
-    /// keep it cheap (e.g. send to a channel).
-    pub fn on_status_change(&self, f: impl Fn(Status) + Send + 'static) {
-        *self.status_cb.lock().unwrap() = Some(Box::new(f));
+    /// Subscribe to status changes. The callback is invoked with the current
+    /// status immediately upon registration (so no transition between `start`
+    /// and registration is lost), and then on every change from the supervisor
+    /// thread. Keep it cheap (e.g. send to a channel).
+    pub fn on_status_change(&self, f: impl Fn(Status) + Send + Sync + 'static) {
+        let cb: supervisor::StatusCallback = Arc::new(f);
+        *self.status_cb.lock().unwrap() = Some(cb.clone());
+        cb(self.status());
     }
 }
 

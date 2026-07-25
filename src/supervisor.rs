@@ -37,6 +37,7 @@ const SUSPICION_GRACE: Duration = Duration::from_secs(3);
 /// Failed recovery cycles before Cooldown.
 const MAX_RECOVERY_CYCLES: u32 = 3;
 const COOLDOWN_DURATION: Duration = Duration::from_secs(30);
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 // HIToolbox is not independently linkable; the Carbon umbrella re-exports it.
 #[link(name = "Carbon", kind = "framework")]
@@ -97,8 +98,14 @@ enum State {
     },
 }
 
+/// Shared handle for the status-change callback. Kept behind an Arc so the
+/// supervisor can clone it out of the lock and invoke it lock-free (a callback
+/// that re-enters `Guard::on_status_change` must not deadlock).
+pub(crate) type StatusCallback = Arc<dyn Fn(Status) + Send + Sync>;
+
 pub(crate) struct Supervisor {
     shutdown: Arc<AtomicBool>,
+    shared: Arc<TapShared>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -107,31 +114,36 @@ impl Supervisor {
         tap: TapThread,
         shared: Arc<TapShared>,
         status: Arc<AtomicU8>,
-        status_cb: Arc<Mutex<Option<Box<dyn Fn(Status) + Send>>>>,
+        status_cb: Arc<Mutex<Option<StatusCallback>>>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
+        let shared2 = shared.clone();
         let join = thread::Builder::new()
             .name("keyvent-supervisor".into())
             .spawn(move || supervise(tap, shared, status, status_cb, shutdown2))
             .expect("spawn keyvent-supervisor thread");
         Self {
             shutdown,
+            shared: shared2,
             join: Some(join),
         }
     }
 
     pub(crate) fn shutdown(mut self) {
         self.shutdown.store(true, SeqCst);
+        // Free system input immediately, even if the tap thread is stuck inside
+        // a user callback and can never process the Shutdown command.
+        self.shared.force_invalidate();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            crate::tap::join_with_timeout(join, SHUTDOWN_JOIN_TIMEOUT, "supervisor");
         }
     }
 }
 
 fn announce(
     status: &Arc<AtomicU8>,
-    status_cb: &Arc<Mutex<Option<Box<dyn Fn(Status) + Send>>>>,
+    status_cb: &Arc<Mutex<Option<StatusCallback>>>,
     current: &mut Status,
     next: Status,
 ) {
@@ -141,8 +153,9 @@ fn announce(
     log::info!("keyvent: status {current:?} -> {next:?}");
     *current = next;
     status.store(next as u8, SeqCst);
-    let cb = status_cb.lock().unwrap();
-    if let Some(cb) = cb.as_ref() {
+    // Clone the Arc out of the lock, then invoke lock-free.
+    let cb = status_cb.lock().unwrap().clone();
+    if let Some(cb) = cb {
         cb(next);
     }
 }
@@ -152,7 +165,7 @@ fn supervise(
     tap: TapThread,
     shared: Arc<TapShared>,
     status: Arc<AtomicU8>,
-    status_cb: Arc<Mutex<Option<Box<dyn Fn(Status) + Send>>>>,
+    status_cb: Arc<Mutex<Option<StatusCallback>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut state = State::Silent;
