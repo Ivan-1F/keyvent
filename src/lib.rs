@@ -37,18 +37,25 @@ pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
 
 /// Lifecycle status of the event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Status {
     /// Events are flowing to the callback.
-    Running,
+    Running = 0,
     /// No permission (or revoked): silent by design; nothing is hooked.
-    Silent,
+    Silent = 1,
     /// Automated recovery failed repeatedly; keyvent paused itself to protect
     /// system input. It resumes on its own when conditions change.
-    Cooldown,
-    /// macOS reports permission granted, but functional probing keeps failing —
-    /// the classic stale-permission state after an app update. The user should
-    /// remove and re-grant the Accessibility entry.
-    StalePermission,
+    Cooldown = 2,
+}
+
+impl Status {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Status::Running,
+            2 => Status::Cooldown,
+            _ => Status::Silent,
+        }
+    }
 }
 
 /// Handle to a running keyvent session. Dropping it stops everything:
@@ -86,12 +93,7 @@ pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
 impl Guard {
     /// Current lifecycle status.
     pub fn status(&self) -> Status {
-        match self.status.load(SeqCst) {
-            0 => Status::Running,
-            1 => Status::Silent,
-            2 => Status::Cooldown,
-            _ => Status::StalePermission,
-        }
+        Status::from_u8(self.status.load(SeqCst))
     }
 
     /// Subscribe to status changes. The callback runs on the supervisor thread;

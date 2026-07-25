@@ -37,22 +37,11 @@ const SUSPICION_GRACE: Duration = Duration::from_secs(3);
 /// Failed recovery cycles before Cooldown.
 const MAX_RECOVERY_CYCLES: u32 = 3;
 const COOLDOWN_DURATION: Duration = Duration::from_secs(30);
-/// AX-hint says trusted but the probe says NULL for this long -> StalePermission.
-const STALE_HINT_AFTER: Duration = Duration::from_secs(60);
-
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-}
 
 // HIToolbox is not independently linkable; the Carbon umbrella re-exports it.
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn IsSecureEventInputEnabled() -> bool;
-}
-
-fn ax_hint() -> bool {
-    unsafe { AXIsProcessTrusted() }
 }
 
 fn secure_input_active() -> bool {
@@ -170,7 +159,6 @@ fn supervise(
     let mut current_status = Status::Silent;
     let mut probe_due = Instant::now(); // probe immediately on start
     let mut cycles = 0u32;
-    let mut stale_since: Option<Instant> = None;
 
     announce(&status, &status_cb, &mut current_status, Status::Silent);
 
@@ -189,27 +177,11 @@ fn supervise(
             State::Silent => {
                 if probed == Some(true) && tap.install() {
                     cycles = 0;
-                    stale_since = None;
                     state = State::Running;
                     announce(&status, &status_cb, &mut current_status, Status::Running);
                     continue;
                 }
-                // Stale-permission hint: AX claims trusted but the functional
-                // probe keeps failing (classic post-update csreq mismatch).
-                let stale_candidate = ax_hint() && probed == Some(false);
-                match (&mut stale_since, stale_candidate) {
-                    (s @ None, true) => *s = Some(now),
-                    (s, true) => {
-                        if s.unwrap().elapsed() > STALE_HINT_AFTER {
-                            announce(&status, &status_cb, &mut current_status, Status::StalePermission);
-                        }
-                    }
-                    (s @ Some(_), false) => *s = None,
-                    (None, false) => {}
-                }
-                if current_status != Status::StalePermission {
-                    announce(&status, &status_cb, &mut current_status, Status::Silent);
-                }
+                announce(&status, &status_cb, &mut current_status, Status::Silent);
             }
 
             State::Running => {

@@ -65,7 +65,6 @@ fn status_name(s: Status) -> &'static str {
         Status::Running => "Running",
         Status::Silent => "Silent",
         Status::Cooldown => "Cooldown",
-        Status::StalePermission => "StalePermission",
     }
 }
 
