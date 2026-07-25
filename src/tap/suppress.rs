@@ -27,9 +27,8 @@ use crate::keycode::Keycode;
 
 /// The Fn/Globe key's keycode.
 pub(crate) const FN_KEYCODE: Keycode = 63;
-/// The keycode of the synthesized event macOS emits on Fn release to trigger
-/// the system "Press 🌐 key to" action (emoji panel, input-source switch, …).
-/// Empirical, verified on macOS 26.
+/// Keycode of the synthesized event macOS emits on Fn release to trigger the
+/// system "Press 🌐 key to" action (emoji panel, input-source switch, …).
 pub(crate) const GLOBE_ACTION_KEYCODE: Keycode = 179;
 
 /// What to do with the raw OS event after bookkeeping.
@@ -100,10 +99,8 @@ impl Suppression {
         released
     }
 
-    /// True if this event is the synthesized globe-action event and the Fn
-    /// cycle that produced it is being swallowed. Swallowing Fn's own events
-    /// cannot stop the system globe action (it is triggered by this separate
-    /// synthesized event), so the two must be suppressed together.
+    /// True if `code` is the globe-action event and the Fn cycle that
+    /// produced it is being swallowed.
     pub(crate) fn swallows_globe_action(&self, code: Keycode) -> bool {
         code == GLOBE_ACTION_KEYCODE && self.swallowed_presses.contains(&FN_KEYCODE)
     }
