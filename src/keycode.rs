@@ -101,9 +101,8 @@ pub fn key_from_code(code: Keycode) -> Key {
     }
 }
 
-/// Reverse mapping. Currently unused by the tap layer (which only needs
-/// `key_from_code`), kept as part of the mapping's completeness contract and
-/// covered by the total roundtrip test.
+/// Reverse mapping. Kept public for completeness even though the tap layer
+/// only needs `key_from_code`.
 #[allow(dead_code)]
 pub fn code_from_key(key: Key) -> Option<Keycode> {
     let code = match key {

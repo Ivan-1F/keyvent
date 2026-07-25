@@ -1,7 +1,7 @@
 //! The supervisor thread: owns the permission-lifecycle state machine.
 //!
-//! Detection philosophy (validated by spike on macOS 26.1): never trust
-//! `AXIsProcessTrusted` or tap-disabled notifications — probe functionally.
+//! Detection philosophy: never trust `AXIsProcessTrusted` or tap-disabled
+//! notifications — probe functionally.
 //!
 //! - **tap_create probe** (every 1s): ground truth for "can this process filter
 //!   keyboard events right now". NULL = no.

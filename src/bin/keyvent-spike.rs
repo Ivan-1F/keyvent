@@ -1,5 +1,5 @@
-//! keyvent soak binary: exercises the LIBRARY (not a private implementation)
-//! under repeatable permission-lifecycle scenarios.
+//! keyvent soak binary: drives the library through repeatable
+//! permission-lifecycle scenarios and logs everything it observes.
 //!
 //!   keyvent-spike watch [--verbose] [--swallow-key K]
 //!   keyvent-spike bench [iterations]
@@ -7,8 +7,8 @@
 //! `watch` starts `keyvent::start`, logs every event and every status change to
 //! stdout and /tmp/keyvent-spike.log, and parks forever. Run it as the signed
 //! .app (scripts/package-spike.sh) and drive permission changes from System
-//! Settings — expected behavior is E2b: revoke -> Silent within ~2s with zero
-//! input impact; re-grant -> Running within ~1s.
+//! Settings: revoking should reach Status::Silent within a couple of seconds
+//! with no input impact; re-granting should return to Status::Running.
 
 use std::env;
 use std::fs::{File, OpenOptions};

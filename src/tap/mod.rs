@@ -112,18 +112,6 @@ impl TapShared {
     pub(crate) fn take_user_input_disabled(&self) -> bool {
         self.user_input_disabled.swap(false, SeqCst)
     }
-
-    // Reserved for future status reporting (panic/timeout counters surfaced
-    // through Guard); kept as part of the shared-state contract.
-    #[allow(dead_code)]
-    pub(crate) fn timeouts(&self) -> u32 {
-        self.timeouts.load(SeqCst)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn callback_panics(&self) -> u32 {
-        self.callback_panics.load(SeqCst)
-    }
 }
 
 /// Commands from the supervisor to the tap thread.
