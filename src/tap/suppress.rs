@@ -25,6 +25,13 @@ use std::collections::HashSet;
 
 use crate::keycode::Keycode;
 
+/// The Fn/Globe key's keycode.
+pub(crate) const FN_KEYCODE: Keycode = 63;
+/// The keycode of the synthesized event macOS emits on Fn release to trigger
+/// the system "Press 🌐 key to" action (emoji panel, input-source switch, …).
+/// Empirical, verified on macOS 26.
+pub(crate) const GLOBE_ACTION_KEYCODE: Keycode = 179;
+
 /// What to do with the raw OS event after bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -93,6 +100,14 @@ impl Suppression {
         released
     }
 
+    /// True if this event is the synthesized globe-action event and the Fn
+    /// cycle that produced it is being swallowed. Swallowing Fn's own events
+    /// cannot stop the system globe action (it is triggered by this separate
+    /// synthesized event), so the two must be suppressed together.
+    pub(crate) fn swallows_globe_action(&self, code: Keycode) -> bool {
+        code == GLOBE_ACTION_KEYCODE && self.swallowed_presses.contains(&FN_KEYCODE)
+    }
+
     #[cfg(test)]
     fn is_tracking(&self, code: Keycode) -> bool {
         self.swallowed_presses.contains(&code)
@@ -139,6 +154,22 @@ mod tests {
         // ...but NOT booked, so the release must still reach the OS.
         assert_eq!(s.release(36), Action::Pass);
         assert!(!s.is_tracking(36));
+    }
+
+    #[test]
+    fn globe_action_follows_fn_swallow() {
+        let mut s = Suppression::default();
+        // Fn cycle not claimed: the globe-action event passes.
+        assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
+        // Fn press swallowed: the whole cycle — Fn release AND the
+        // globe-action event — is suppressed.
+        assert_eq!(s.press(FN_KEYCODE, false, true), Action::Swallow);
+        assert!(s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
+        // After the Fn release is booked, the cycle is over.
+        assert_eq!(s.release(FN_KEYCODE), Action::Swallow);
+        assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
+        // Unrelated keycodes are never globe actions.
+        assert!(!s.swallows_globe_action(36));
     }
 
     #[test]

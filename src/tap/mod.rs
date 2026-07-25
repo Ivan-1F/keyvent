@@ -474,6 +474,13 @@ unsafe extern "C-unwind" fn raw_callback(
         && CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventAutorepeat) != 0;
     let snapshot = modifiers_from_cg(CGEvent::flags(Some(cg)));
 
+    // Globe-action suppression: when an Fn press cycle is being swallowed,
+    // the synthesized globe-action event that macOS emits on Fn release is
+    // swallowed too — before it reaches any consumer-side bookkeeping.
+    if ctx.suppression.swallows_globe_action(keycode) {
+        return null_mut();
+    }
+
     let key_event = convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind);
 
     // Consumer side: pairing ledger decides what the callback may see.
