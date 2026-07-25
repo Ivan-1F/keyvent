@@ -24,6 +24,12 @@
 //! broken heartbeat and tears the tap down for good measure. The contract is
 //! what keeps any of that from ever happening: do slow work on your own
 //! thread — send the event over a channel and decide quickly.
+//!
+//! The swallow decision (`true` return value) is only consulted for **presses**
+//! (including key repeats, which are safe to swallow mid-cycle). Releases
+//! always follow what the press did — a swallowed press swallows its release,
+//! a passed press always passes its release — so the OS can never be left
+//! with a phantom release or a stuck key.
 
 mod event;
 mod keycode;

@@ -499,19 +499,19 @@ unsafe extern "C-unwind" fn raw_callback(
                 dispatch(ctx, synthetic_release(keycode));
             }
             let user_swallow = dispatch(ctx, key_event);
-            match ctx.suppression.press(keycode, user_swallow) {
+            match ctx.suppression.press(keycode, is_repeat, user_swallow) {
                 Action::Swallow => null_mut(),
                 Action::Pass => event.as_ptr(),
             }
         }
         KeyEventKind::Release => {
             let deliver = ctx.pairing.release(keycode) == Plan::Deliver;
-            let user_swallow = if deliver {
-                dispatch(ctx, key_event)
-            } else {
-                false
-            };
-            match ctx.suppression.release(keycode, user_swallow) {
+            if deliver {
+                dispatch(ctx, key_event);
+            }
+            // The release's swallow decision is derived from the press
+            // (see Suppression); the callback is not consulted.
+            match ctx.suppression.release(keycode) {
                 Action::Swallow => null_mut(),
                 Action::Pass => event.as_ptr(),
             }

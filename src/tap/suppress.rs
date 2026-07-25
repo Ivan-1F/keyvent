@@ -1,17 +1,25 @@
 //! Suppression bookkeeping: keeps the OS-side event stream consistent.
 //!
-//! The invariant: **a swallowed press must be matched by a swallowed release.**
-//! If the press was eaten but the release passes through, the focused app sees
-//! a release for a press it never witnessed (phantom release). If the press
-//! passed but the release is eaten, the OS believes the key is still held.
+//! The invariant, per key-press cycle: **press and release must travel
+//! together.** A swallowed press must be matched by a swallowed release
+//! (otherwise apps see a release for a press they never witnessed), and a
+//! passed press must be matched by a passed release (otherwise the OS believes
+//! the key is held forever — a system-wide stuck key).
 //!
-//! The user callback decides press suppression freely. Release suppression is
-//! *forced* for keys whose press was swallowed; otherwise the callback decides.
+//! Decision ownership:
+//! - The callback owns the *press* decision, once per cycle.
+//! - The *release* decision is derived, never asked: it follows whatever the
+//!   press did.
+//! - Key repeats are free: swallowing them is harmless (the OS just sees fewer
+//!   repeated KeyDowns), so the callback decides per repeat — but repeats
+//!   never create bookkeeping entries, so they cannot corrupt the release
+//!   decision.
 //!
 //! After an event-stream interruption (tap timeout, teardown), presses may
 //! have lost their releases. [`Suppression::reconcile`] compares the book
 //! against physical key state and reports which tracked presses are actually
-//! up, so the tap layer can emit synthetic release events to the consumer.
+//! up, so a later rebuild doesn't force-swallow releases for presses the OS
+//! actually saw.
 
 use std::collections::HashSet;
 
@@ -28,19 +36,29 @@ pub(crate) enum Action {
 
 #[derive(Default)]
 pub(crate) struct Suppression {
-    /// Keycodes whose press was swallowed and whose release is still pending.
+    /// Keycodes whose initial press was swallowed and whose release is still
+    /// pending. Only initial presses create entries — never repeats.
     swallowed_presses: HashSet<Keycode>,
 }
 
 impl Suppression {
     /// Book a press. `user_swallow` is the callback's decision.
-    ///
-    /// While a press of this key is being swallowed, ALL its subsequent down
-    /// events (key repeats, or a re-press after a lost release) are swallowed
-    /// too — otherwise the OS would see repeated KeyDowns for a press it never
-    /// witnessed.
-    pub(crate) fn press(&mut self, code: Keycode, user_swallow: bool) -> Action {
-        if user_swallow || self.swallowed_presses.contains(&code) {
+    pub(crate) fn press(&mut self, code: Keycode, is_repeat: bool, user_swallow: bool) -> Action {
+        if self.swallowed_presses.contains(&code) {
+            // Mid-cycle of a swallowed press: everything (repeats, re-press
+            // after a lost release) stays swallowed.
+            return Action::Swallow;
+        }
+        if is_repeat {
+            // Safe to swallow (fewer repeated KeyDowns for the OS), but never
+            // recorded: the release must follow the INITIAL press's decision.
+            return if user_swallow {
+                Action::Swallow
+            } else {
+                Action::Pass
+            };
+        }
+        if user_swallow {
             self.swallowed_presses.insert(code);
             Action::Swallow
         } else {
@@ -48,12 +66,11 @@ impl Suppression {
         }
     }
 
-    /// Book a release. Swallow is forced if the matching press was swallowed.
-    pub(crate) fn release(&mut self, code: Keycode, user_swallow: bool) -> Action {
+    /// Book a release. The decision is derived from the press, never asked:
+    /// swallowed press -> forced swallow; anything else -> forced pass, so a
+    /// passed press can never leave the OS with a stuck key.
+    pub(crate) fn release(&mut self, code: Keycode) -> Action {
         if self.swallowed_presses.remove(&code) {
-            return Action::Swallow;
-        }
-        if user_swallow {
             Action::Swallow
         } else {
             Action::Pass
@@ -61,7 +78,7 @@ impl Suppression {
     }
 
     /// Drop entries whose key is no longer physically held; returns their
-    /// keycodes so the tap layer can emit synthetic releases to the consumer.
+    /// keycodes so the tap layer can keep the books clean across rebuilds.
     /// `is_held` reports physical state (CGEventSourceKeyState).
     pub(crate) fn reconcile(&mut self, is_held: impl Fn(Keycode) -> bool) -> Vec<Keycode> {
         let released: Vec<Keycode> = self
@@ -89,39 +106,46 @@ mod tests {
     #[test]
     fn swallowed_press_forces_swallowed_release() {
         let mut s = Suppression::default();
-        assert_eq!(s.press(36, true), Action::Swallow);
-        // Callback would pass the release; bookkeeping forces swallow.
-        assert_eq!(s.release(36, false), Action::Swallow);
+        assert_eq!(s.press(36, false, true), Action::Swallow);
+        assert_eq!(s.release(36), Action::Swallow);
         assert!(!s.is_tracking(36));
     }
 
     #[test]
-    fn passed_press_release_follows_callback() {
+    fn release_of_passed_press_always_passes() {
         let mut s = Suppression::default();
-        assert_eq!(s.press(36, false), Action::Pass);
-        assert_eq!(s.release(36, false), Action::Pass);
-        // Callback may still swallow a release of a passed press (its choice).
-        assert_eq!(s.press(36, false), Action::Pass);
-        assert_eq!(s.release(36, true), Action::Swallow);
+        assert_eq!(s.press(36, false, false), Action::Pass);
+        // The callback may WANT to swallow this release; it doesn't get a say —
+        // the OS saw the press, so it must see the release.
+        assert_eq!(s.release(36), Action::Pass);
     }
 
     #[test]
     fn repeat_during_swallowed_press_is_swallowed() {
         let mut s = Suppression::default();
-        assert_eq!(s.press(36, true), Action::Swallow);
-        // Callback passes the key-repeat downs; bookkeeping still swallows them.
-        assert_eq!(s.press(36, false), Action::Swallow);
-        assert_eq!(s.press(36, false), Action::Swallow);
-        assert_eq!(s.release(36, false), Action::Swallow);
-        // After the release, the key is back to normal.
-        assert_eq!(s.press(36, false), Action::Pass);
+        assert_eq!(s.press(36, false, true), Action::Swallow);
+        assert_eq!(s.press(36, true, false), Action::Swallow); // repeat, cb passes
+        assert_eq!(s.press(36, true, false), Action::Swallow);
+        assert_eq!(s.release(36), Action::Swallow);
+        assert_eq!(s.press(36, false, false), Action::Pass); // back to normal
+    }
+
+    #[test]
+    fn swallowing_a_repeat_does_not_stick_the_key() {
+        let mut s = Suppression::default();
+        // Hold-to-activate: initial press passes, a later repeat is swallowed.
+        assert_eq!(s.press(36, false, false), Action::Pass);
+        assert_eq!(s.press(36, true, true), Action::Swallow); // repeat swallowed
+        // ...but NOT booked, so the release must still reach the OS.
+        assert_eq!(s.release(36), Action::Pass);
+        assert!(!s.is_tracking(36));
     }
 
     #[test]
     fn reconcile_drops_physically_released() {
         let mut s = Suppression::default();
-        s.press(36, true);
-        s.press(56, true);
+        s.press(36, false, true);
+        s.press(56, false, true);
         // 36 physically released, 56 still held.
         let released = s.reconcile(|code| code == 56);
         assert_eq!(released, vec![36]);
