@@ -5,26 +5,36 @@
 
 use crate::KeyEvent;
 use crate::tap::BoxedCallback;
+use std::sync::Weak;
 use std::sync::mpsc;
 
 pub(crate) enum DispatcherCommand {
-    Add(u64, BoxedCallback),
-    Remove(u64),
+    Add(BoxedCallback, Weak<()>),
 }
 
 pub(crate) struct Dispatcher {
-    pub(crate) callbacks: Vec<(u64, BoxedCallback)>,
-    pub(crate) cmd_rx: mpsc::Receiver<DispatcherCommand>,
+    callbacks: Vec<(Weak<()>, BoxedCallback)>,
+    cmd_rx: mpsc::Receiver<DispatcherCommand>,
 }
 
 impl Dispatcher {
+    pub(crate) fn new() -> (mpsc::Sender<DispatcherCommand>, Self) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        (
+            cmd_tx,
+            Self {
+                callbacks: Vec::new(),
+                cmd_rx,
+            },
+        )
+    }
+
     pub(crate) fn handle(&mut self, event: KeyEvent) -> bool {
-        while let Ok(command) = self.cmd_rx.try_recv() {
-            match command {
-                DispatcherCommand::Add(id, callback) => self.callbacks.push((id, callback)),
-                DispatcherCommand::Remove(id) => self.callbacks.retain(|(cid, _)| *cid != id),
-            }
+        while let Ok(DispatcherCommand::Add(callback, token)) = self.cmd_rx.try_recv() {
+            self.callbacks.push((token, callback));
         }
+        // A registration lives as long as its guard: prune dead ones.
+        self.callbacks.retain(|(token, _)| token.strong_count() > 0);
         let mut suppress = false;
         for (_, callback) in &mut self.callbacks {
             // Each callback is panic-isolated: one panicking callback must not
@@ -47,14 +57,6 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering::SeqCst;
 
-    fn dispatcher() -> Dispatcher {
-        let (_tx, rx) = mpsc::channel();
-        Dispatcher {
-            callbacks: Vec::new(),
-            cmd_rx: rx,
-        }
-    }
-
     fn event() -> KeyEvent {
         KeyEvent {
             key: Key::KeyA,
@@ -64,42 +66,43 @@ mod tests {
         }
     }
 
+    fn add(tx: &mpsc::Sender<DispatcherCommand>, callback: BoxedCallback) -> Arc<()> {
+        let token = Arc::new(());
+        let _ = tx.send(DispatcherCommand::Add(callback, Arc::downgrade(&token)));
+        token
+    }
+
     #[test]
-    fn dispatcher_ors_swallow_decisions() {
-        let mut d = dispatcher();
-        d.callbacks.push((0, Box::new(|_| false)));
-        d.callbacks.push((1, Box::new(|_| true)));
-        d.callbacks.push((2, Box::new(|_| false)));
+    fn dispatcher_ors_suppress_decisions() {
+        let (tx, mut d) = Dispatcher::new();
+        let _t0 = add(&tx, Box::new(|_| false));
+        let _t1 = add(&tx, Box::new(|_| true));
+        let _t2 = add(&tx, Box::new(|_| false));
         assert!(d.handle(event()));
     }
 
     #[test]
-    fn dispatcher_applies_commands_before_events() {
-        let (tx, rx) = mpsc::channel();
-        let mut d = Dispatcher {
-            callbacks: Vec::new(),
-            cmd_rx: rx,
-        };
-        tx.send(DispatcherCommand::Add(0, Box::new(|_| true)))
-            .unwrap();
+    fn dispatcher_prunes_dropped_registrations() {
+        let (tx, mut d) = Dispatcher::new();
+        let token = add(&tx, Box::new(|_| true));
         assert!(d.handle(event()));
-        tx.send(DispatcherCommand::Remove(0)).unwrap();
+        drop(token);
         assert!(!d.handle(event()));
     }
 
     #[test]
     fn dispatcher_isolates_callback_panics() {
-        let mut d = dispatcher();
+        let (tx, mut d) = Dispatcher::new();
         let called = Arc::new(AtomicBool::new(false));
         let called2 = called.clone();
-        d.callbacks.push((0, Box::new(|_| panic!("boom"))));
-        d.callbacks.push((
-            1,
+        let _t0 = add(&tx, Box::new(|_| panic!("boom")));
+        let _t1 = add(
+            &tx,
             Box::new(move |_| {
                 called2.store(true, SeqCst);
                 false
             }),
-        ));
+        );
         // The panic counts as pass-through, and later callbacks still ran.
         assert!(!d.handle(event()));
         assert!(called.load(SeqCst));

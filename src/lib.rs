@@ -30,8 +30,6 @@ mod keycode;
 mod supervisor;
 mod tap;
 
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, Weak, mpsc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
@@ -39,7 +37,6 @@ pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
 
 use crate::dispatcher::{Dispatcher, DispatcherCommand};
 use supervisor::StatusBroadcast;
-use tap::BoxedCallback;
 
 /// Lifecycle status of the event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,26 +63,21 @@ impl Status {
 
 /// The process-wide engine slot. Holds a weak reference: the engine is alive
 /// exactly as long as at least one guard is.
-static ENGINE: Mutex<Option<Weak<EngineInner>>> = Mutex::new(None);
+static ENGINE: Mutex<Option<Weak<Engine>>> = Mutex::new(None);
 
 /// The process-wide engine: one tap thread + one supervisor, shared by all
 /// guards. Created by the first `start`; dropped — and shut down — when the
 /// last guard drops.
-struct EngineInner {
+struct Engine {
     supervisor: Option<supervisor::Supervisor>,
     commands: mpsc::Sender<DispatcherCommand>,
     broadcast: Arc<StatusBroadcast>,
-    next_id: AtomicU64,
 }
 
-impl EngineInner {
+impl Engine {
     fn spawn() -> Arc<Self> {
         let shared = Arc::new(tap::TapShared::new());
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let mut dispatcher = Dispatcher {
-            callbacks: Vec::new(),
-            cmd_rx,
-        };
+        let (commands, mut dispatcher) = Dispatcher::new();
         let tap = tap::TapThread::spawn(
             Box::new(move |event| dispatcher.handle(event)),
             shared.clone(),
@@ -94,26 +86,31 @@ impl EngineInner {
         let supervisor = supervisor::Supervisor::spawn(tap, shared, broadcast.clone());
         Arc::new(Self {
             supervisor: Some(supervisor),
-            commands: cmd_tx,
+            commands,
             broadcast,
-            next_id: AtomicU64::new(0),
         })
     }
 
-    fn add_callback(self: &Arc<Self>, callback: BoxedCallback) -> Guard {
-        let id = self.next_id.fetch_add(1, Relaxed);
-        // If the tap thread is gone the callback simply never runs; the
-        // guard's Remove later fails the same harmless way.
-        let _ = self.commands.send(DispatcherCommand::Add(id, callback));
+    fn add_callback(
+        self: &Arc<Self>,
+        callback: impl FnMut(KeyEvent) -> bool + Send + 'static,
+    ) -> Guard {
+        let registration = Arc::new(());
+        // If the tap thread is gone the callback simply never runs; it is
+        // pruned on the next event all the same.
+        let _ = self.commands.send(DispatcherCommand::Add(
+            Box::new(callback),
+            Arc::downgrade(&registration),
+        ));
         Guard {
-            id,
+            _registration: registration,
             engine: self.clone(),
             status_rx: self.broadcast.subscribe(),
         }
     }
 }
 
-impl Drop for EngineInner {
+impl Drop for Engine {
     fn drop(&mut self) {
         // Runs on the thread dropping the last guard, never under the global
         // lock. Joining the threads can take seconds in the worst case; the
@@ -130,8 +127,10 @@ impl Drop for EngineInner {
 /// Dropping it stops the callback, dropping the last guard stops everything
 /// cleanly.
 pub struct Guard {
-    id: u64,
-    engine: Arc<EngineInner>,
+    /// Keeps the registration alive; the dispatcher prunes the callback once
+    /// this token is gone.
+    _registration: Arc<()>,
+    engine: Arc<Engine>,
     status_rx: mpsc::Receiver<Status>,
 }
 
@@ -183,12 +182,12 @@ pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
     let engine = match slot.as_ref().and_then(Weak::upgrade) {
         Some(engine) => engine,
         None => {
-            let engine = EngineInner::spawn();
+            let engine = Engine::spawn();
             *slot = Some(Arc::downgrade(&engine));
             engine
         }
     };
-    engine.add_callback(Box::new(callback))
+    engine.add_callback(callback)
 }
 
 impl Guard {
@@ -200,17 +199,6 @@ impl Guard {
     /// Stream of status changes.
     pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
         &self.status_rx
-    }
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        // Unregister only. If this was the last guard, dropping the Arc below
-        // runs EngineInner::drop, which shuts the engine down.
-        let _ = self
-            .engine
-            .commands
-            .send(DispatcherCommand::Remove(self.id));
     }
 }
 
