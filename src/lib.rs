@@ -1,46 +1,31 @@
-//! keyvent — macOS global hotkeys that can never freeze your input.
+//! Global keyboard event stream for macOS, with automatic Accessibility
+//! permission lifecycle management.
 //!
 //! One callback in, everything else automatic: no Accessibility permission
 //! means silence; granting starts the event stream; revoking stops it without
 //! touching system input; re-granting resumes.
 //!
-//! # Example
+//! # Usage
 //!
 //! ```no_run
+//! // This will return immediately.
 //! let guard = keyvent::start(|event| {
-//!     // Return true to swallow the event system-wide.
+//!     // Return true to suppress the event system-wide.
 //!     event.key == keyvent::Key::F5
 //! });
-//! // …later: dropping the last guard stops everything cleanly.
+//! // Dropping the guard stops the callback, dropping the last guard stops everything cleanly.
 //! ```
 //!
-//! # The shared engine
+//! # Platform Caveats
 //!
-//! The first [`start`] call creates the process-wide engine — one event tap,
-//! one supervisor thread. Later calls register additional callbacks on the
-//! same tap; a press is swallowed if ANY callback returns true. Dropping a
-//! [`Guard`] unregisters its callback; the engine shuts down when the last
-//! guard is dropped.
+//! ## macOS
 //!
-//! # Callback contract
+//! The process needs to be granted the Accessibility permission (System
+//! Preferences > Privacy & Security > Accessibility)
 //!
-//! The callback runs on the event-tap thread, on the critical path of every
-//! keystroke in the session. It **must return quickly**: no blocking, no
-//! locking contended mutexes, no synchronous cross-thread calls. If it stalls
-//! anyway, the OS watchdog disables the tap (keyboard input hesitates for up
-//! to ~1s per event, then flows again), and keyvent's supervisor notices the
-//! broken heartbeat and tears the tap down for good measure. The contract is
-//! what keeps any of that from ever happening: do slow work on your own
-//! thread — send the event over a channel and decide quickly.
-//!
-//! When several callbacks are registered, each runs on every event, so the
-//! contract applies to each of them.
-//!
-//! The swallow decision (`true` return value) is only consulted for **presses**
-//! (including key repeats, which are safe to swallow mid-cycle). Releases
-//! always follow what the press did — a swallowed press swallows its release,
-//! a passed press always passes its release — so the OS can never be left
-//! with a phantom release or a stuck key.
+//! Without Accessibility permission, the stream simply stays silent; the stream
+//! starts automatically once permission is granted, and stops cleanly on
+//! revocation.
 
 mod event;
 pub mod hotkey;
@@ -48,9 +33,9 @@ mod keycode;
 mod supervisor;
 mod tap;
 
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::AtomicU64;
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, Weak, mpsc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
 pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
@@ -64,7 +49,7 @@ use tap::BoxedCallback;
 pub enum Status {
     /// Events are flowing to the callback.
     Running = 0,
-    /// No permission (or revoked): silent by design; nothing is hooked.
+    /// No Accessibility permission. Nothing is sent to the callback.
     Silent = 1,
     /// Automated recovery failed repeatedly; keyvent paused itself to protect
     /// system input. It resumes on its own when conditions change.
@@ -179,25 +164,59 @@ impl Drop for EngineInner {
     }
 }
 
-/// Handle to one callback registration in the shared keyvent engine.
-/// Dropping it unregisters the callback; dropping the LAST guard stops
-/// everything: the tap is invalidated, both threads exit, no state leaks.
+/// Handle to one callback registration.
+///
+/// Dropping it stops the callback, dropping the last guard stops everything
+/// cleanly.
 pub struct Guard {
     id: u64,
     engine: Arc<EngineInner>,
     status_rx: mpsc::Receiver<Status>,
 }
 
-/// Start the global event stream with permission lifecycle fully managed.
+/// Start the global event stream.
 ///
-/// The `callback` receives every keyboard event (see its contract above) and
-/// returns whether to swallow it system-wide. Without Accessibility permission
-/// this simply stays silent; the stream starts automatically once permission
-/// is granted, and stops cleanly on revocation.
+/// ```no_run
+/// // This will return immediately.
+/// let guard = keyvent::start(|event| {
+///     // Return true to suppress the event system-wide.
+///     event.key == keyvent::Key::F5
+/// });
+/// // Dropping the guard stops the callback, dropping the last guard stops everything cleanly.
+/// ```
 ///
-/// The first call creates the process-wide engine; later calls share it (see
-/// "The shared engine" above). Dropping the returned [`Guard`] unregisters
-/// this callback — a callback removed mid-press never sees the release.
+/// The first call creates the process-wide engine, later calls share it.
+/// Dropping the returned [`Guard`] unregisters this callback, dropping the last
+/// guard stops everything cleanly.
+///
+/// ## Callback
+///
+/// The `callback` receives every keyboard event and returns whether to suppress
+/// it system-wide.
+///
+/// The callback runs on the event-tap thread, on the critical path of every
+/// keystroke. It **must return quickly**: no blocking, no locking contended
+/// mutexes, no synchronous cross-thread calls.
+///
+/// Do slow work on your own thread: send the event over a channel and decide
+/// quickly.
+///
+/// ### Suppressing the event
+///
+/// Return `true` from the callback to suppress this event and return `false` to
+/// let it pass. This is only consulted for presses (including key repeats).
+/// Releases always follow what the press did, so the OS can never be left with
+/// a phantom release or a stuck key.
+///
+/// ## Platform Caveats
+///
+/// ### macOS
+///
+/// The process needs to be granted the Accessibility permission (System
+/// Preferences > Privacy & Security > Accessibility)
+/// Without Accessibility permission, the stream simply stays silent; the stream
+/// starts automatically once permission is granted, and stops cleanly on
+/// revocation.
 pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
     let mut slot = ENGINE.lock().unwrap();
     let engine = match slot.as_ref().and_then(Weak::upgrade) {
@@ -212,14 +231,12 @@ pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
 }
 
 impl Guard {
-    /// Current lifecycle status.
+    /// Current engine status.
     pub fn status(&self) -> Status {
         self.engine.broadcast.current()
     }
 
-    /// Stream of status changes. Changes emitted after this guard's `start`
-    /// are retained in the channel. Use `recv` to block for the next change
-    /// or `try_recv` to poll.
+    /// Stream of status changes.
     pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
         &self.status_rx
     }
@@ -272,7 +289,8 @@ mod tests {
             callbacks: Vec::new(),
             cmd_rx: rx,
         };
-        tx.send(CallbackCommand::Add(0, Box::new(|_| true))).unwrap();
+        tx.send(CallbackCommand::Add(0, Box::new(|_| true)))
+            .unwrap();
         assert!(d.handle(event()));
         tx.send(CallbackCommand::Remove(0)).unwrap();
         assert!(!d.handle(event()));
@@ -301,30 +319,11 @@ mod tests {
     fn guards_share_and_release_engine() {
         let g1 = start(|_| false);
         let g2 = start(|_| false);
-        assert_eq!(
-            ENGINE.lock().unwrap().as_ref().unwrap().strong_count(),
-            2
-        );
+        assert_eq!(ENGINE.lock().unwrap().as_ref().unwrap().strong_count(), 2);
         assert_eq!(g1.status(), g2.status());
         drop(g1);
-        assert!(
-            ENGINE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .upgrade()
-                .is_some()
-        );
+        assert!(ENGINE.lock().unwrap().as_ref().unwrap().upgrade().is_some());
         drop(g2);
-        assert!(
-            ENGINE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .upgrade()
-                .is_none()
-        );
+        assert!(ENGINE.lock().unwrap().as_ref().unwrap().upgrade().is_none());
     }
 }
