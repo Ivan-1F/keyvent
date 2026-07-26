@@ -1,10 +1,6 @@
 //! Global keyboard event stream for macOS, with automatic Accessibility
 //! permission lifecycle management.
 //!
-//! One callback in, everything else automatic: no Accessibility permission
-//! means silence; granting starts the event stream; revoking stops it without
-//! touching system input; re-granting resumes.
-//!
 //! # Usage
 //!
 //! ```no_run
