@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
 pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
 
-use crate::dispatcher::{CallbackCommand, Dispatcher};
+use crate::dispatcher::{Dispatcher, DispatcherCommand};
 use supervisor::StatusBroadcast;
 use tap::BoxedCallback;
 
@@ -73,7 +73,7 @@ static ENGINE: Mutex<Option<Weak<EngineInner>>> = Mutex::new(None);
 /// last guard drops.
 struct EngineInner {
     supervisor: Option<supervisor::Supervisor>,
-    commands: mpsc::Sender<CallbackCommand>,
+    commands: mpsc::Sender<DispatcherCommand>,
     broadcast: Arc<StatusBroadcast>,
     next_id: AtomicU64,
 }
@@ -104,7 +104,7 @@ impl EngineInner {
         let id = self.next_id.fetch_add(1, Relaxed);
         // If the tap thread is gone the callback simply never runs; the
         // guard's Remove later fails the same harmless way.
-        let _ = self.commands.send(CallbackCommand::Add(id, callback));
+        let _ = self.commands.send(DispatcherCommand::Add(id, callback));
         Guard {
             id,
             engine: self.clone(),
@@ -207,7 +207,10 @@ impl Drop for Guard {
     fn drop(&mut self) {
         // Unregister only. If this was the last guard, dropping the Arc below
         // runs EngineInner::drop, which shuts the engine down.
-        let _ = self.engine.commands.send(CallbackCommand::Remove(self.id));
+        let _ = self
+            .engine
+            .commands
+            .send(DispatcherCommand::Remove(self.id));
     }
 }
 

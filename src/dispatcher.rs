@@ -8,7 +8,7 @@ use crate::tap::BoxedCallback;
 use std::sync::mpsc;
 
 /// A registration change sent to the dispatcher on the tap thread.
-pub(crate) enum CallbackCommand {
+pub(crate) enum DispatcherCommand {
     Add(u64, BoxedCallback),
     Remove(u64),
 }
@@ -19,28 +19,28 @@ pub(crate) enum CallbackCommand {
 /// locking on the tap thread, per the callback contract.
 pub(crate) struct Dispatcher {
     pub(crate) callbacks: Vec<(u64, BoxedCallback)>,
-    pub(crate) cmd_rx: mpsc::Receiver<CallbackCommand>,
+    pub(crate) cmd_rx: mpsc::Receiver<DispatcherCommand>,
 }
 
 impl Dispatcher {
     pub(crate) fn handle(&mut self, event: KeyEvent) -> bool {
         while let Ok(command) = self.cmd_rx.try_recv() {
             match command {
-                CallbackCommand::Add(id, callback) => self.callbacks.push((id, callback)),
-                CallbackCommand::Remove(id) => self.callbacks.retain(|(cid, _)| *cid != id),
+                DispatcherCommand::Add(id, callback) => self.callbacks.push((id, callback)),
+                DispatcherCommand::Remove(id) => self.callbacks.retain(|(cid, _)| *cid != id),
             }
         }
-        let mut swallow = false;
+        let mut suppress = false;
         for (_, callback) in &mut self.callbacks {
             // Each callback is panic-isolated: one panicking callback must not
             // starve the others of this (or any later) event.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(event))) {
-                Ok(true) => swallow = true,
+                Ok(true) => suppress = true,
                 Ok(false) => {}
                 Err(_) => log::error!("keyvent: user callback panicked; treated as pass-through"),
             }
         }
-        swallow
+        suppress
     }
 }
 
@@ -85,10 +85,10 @@ mod tests {
             callbacks: Vec::new(),
             cmd_rx: rx,
         };
-        tx.send(CallbackCommand::Add(0, Box::new(|_| true)))
+        tx.send(DispatcherCommand::Add(0, Box::new(|_| true)))
             .unwrap();
         assert!(d.handle(event()));
-        tx.send(CallbackCommand::Remove(0)).unwrap();
+        tx.send(DispatcherCommand::Remove(0)).unwrap();
         assert!(!d.handle(event()));
     }
 
