@@ -7,16 +7,11 @@ use crate::KeyEvent;
 use crate::tap::BoxedCallback;
 use std::sync::mpsc;
 
-/// A registration change sent to the dispatcher on the tap thread.
 pub(crate) enum DispatcherCommand {
     Add(u64, BoxedCallback),
     Remove(u64),
 }
 
-/// The tap thread's single callback: fans each event out to every registered
-/// callback and ORs the swallow decisions. Commands are applied before the
-/// event, so (un)registration takes effect on the very next event — with no
-/// locking on the tap thread, per the callback contract.
 pub(crate) struct Dispatcher {
     pub(crate) callbacks: Vec<(u64, BoxedCallback)>,
     pub(crate) cmd_rx: mpsc::Receiver<DispatcherCommand>,
