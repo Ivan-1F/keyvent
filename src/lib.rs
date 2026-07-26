@@ -23,6 +23,7 @@
 //! starts automatically once permission is granted, and stops cleanly on
 //! revocation.
 
+mod dispatcher;
 mod event;
 pub mod hotkey;
 mod keycode;
@@ -36,6 +37,7 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
 pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
 
+use crate::dispatcher::{CallbackCommand, Dispatcher};
 use supervisor::StatusBroadcast;
 use tap::BoxedCallback;
 
@@ -65,43 +67,6 @@ impl Status {
 /// The process-wide engine slot. Holds a weak reference: the engine is alive
 /// exactly as long as at least one guard is.
 static ENGINE: Mutex<Option<Weak<EngineInner>>> = Mutex::new(None);
-
-/// A registration change sent to the dispatcher on the tap thread.
-enum CallbackCommand {
-    Add(u64, BoxedCallback),
-    Remove(u64),
-}
-
-/// The tap thread's single callback: fans each event out to every registered
-/// callback and ORs the swallow decisions. Commands are applied before the
-/// event, so (un)registration takes effect on the very next event — with no
-/// locking on the tap thread, per the callback contract.
-struct Dispatcher {
-    callbacks: Vec<(u64, BoxedCallback)>,
-    cmd_rx: mpsc::Receiver<CallbackCommand>,
-}
-
-impl Dispatcher {
-    fn handle(&mut self, event: KeyEvent) -> bool {
-        while let Ok(command) = self.cmd_rx.try_recv() {
-            match command {
-                CallbackCommand::Add(id, callback) => self.callbacks.push((id, callback)),
-                CallbackCommand::Remove(id) => self.callbacks.retain(|(cid, _)| *cid != id),
-            }
-        }
-        let mut swallow = false;
-        for (_, callback) in &mut self.callbacks {
-            // Each callback is panic-isolated: one panicking callback must not
-            // starve the others of this (or any later) event.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(event))) {
-                Ok(true) => swallow = true,
-                Ok(false) => {}
-                Err(_) => log::error!("keyvent: user callback panicked; treated as pass-through"),
-            }
-        }
-        swallow
-    }
-}
 
 /// The process-wide engine: one tap thread + one supervisor, shared by all
 /// guards. Created by the first `start`; dropped — and shut down — when the
@@ -248,73 +213,12 @@ impl Drop for Guard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering::SeqCst;
+    use crate::ENGINE;
 
-    fn dispatcher() -> Dispatcher {
-        let (_tx, rx) = mpsc::channel();
-        Dispatcher {
-            callbacks: Vec::new(),
-            cmd_rx: rx,
-        }
-    }
-
-    fn event() -> KeyEvent {
-        KeyEvent {
-            key: Key::KeyA,
-            kind: KeyEventKind::Press,
-            modifiers: Modifiers::NONE,
-            is_repeat: false,
-        }
-    }
-
-    #[test]
-    fn dispatcher_ors_swallow_decisions() {
-        let mut d = dispatcher();
-        d.callbacks.push((0, Box::new(|_| false)));
-        d.callbacks.push((1, Box::new(|_| true)));
-        d.callbacks.push((2, Box::new(|_| false)));
-        assert!(d.handle(event()));
-    }
-
-    #[test]
-    fn dispatcher_applies_commands_before_events() {
-        let (tx, rx) = mpsc::channel();
-        let mut d = Dispatcher {
-            callbacks: Vec::new(),
-            cmd_rx: rx,
-        };
-        tx.send(CallbackCommand::Add(0, Box::new(|_| true)))
-            .unwrap();
-        assert!(d.handle(event()));
-        tx.send(CallbackCommand::Remove(0)).unwrap();
-        assert!(!d.handle(event()));
-    }
-
-    #[test]
-    fn dispatcher_isolates_callback_panics() {
-        let mut d = dispatcher();
-        let called = Arc::new(AtomicBool::new(false));
-        let called2 = called.clone();
-        d.callbacks.push((0, Box::new(|_| panic!("boom"))));
-        d.callbacks.push((
-            1,
-            Box::new(move |_| {
-                called2.store(true, SeqCst);
-                false
-            }),
-        ));
-        // The panic counts as pass-through, and later callbacks still ran.
-        assert!(!d.handle(event()));
-        assert!(called.load(SeqCst));
-    }
-
-    // NOTE: uses the process-global ENGINE; no other test may call `start`.
     #[test]
     fn guards_share_and_release_engine() {
-        let g1 = start(|_| false);
-        let g2 = start(|_| false);
+        let g1 = crate::start(|_| false);
+        let g2 = crate::start(|_| false);
         assert_eq!(ENGINE.lock().unwrap().as_ref().unwrap().strong_count(), 2);
         assert_eq!(g1.status(), g2.status());
         drop(g1);
