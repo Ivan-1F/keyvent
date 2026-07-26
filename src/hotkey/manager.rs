@@ -2,47 +2,63 @@
 //! callback is the matching engine; consumers receive `HotkeyEvent`s over a
 //! channel — no user code ever runs on the tap thread.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::collections::HashSet;
+use std::sync::{Mutex, mpsc};
 
 use crate::{Guard, Status};
 
 use super::engine::{Matcher, Registered};
 use super::{Hotkey, HotkeyEvent, HotkeyId, Suppression};
 
+/// A registration change sent to the matcher on the tap thread.
+enum Command {
+    Register(HotkeyId, Registered),
+    Unregister(HotkeyId),
+}
+
+/// User-thread registration state: id allocation and the live id set (for
+/// `unregister`'s return value). The tap thread never touches it.
+#[derive(Default)]
+struct Registry {
+    next_id: u32,
+    live: HashSet<HotkeyId>,
+}
+
 /// Registers hotkeys and delivers their activations over a channel.
 ///
 /// Each manager owns an independent engine (tap thread + supervisor). Create
 /// one per application.
 pub struct HotkeyManager {
-    registered: Arc<Mutex<HashMap<HotkeyId, Registered>>>,
-    next_id: AtomicU32,
+    commands: mpsc::Sender<Command>,
+    registry: Mutex<Registry>,
     rx: mpsc::Receiver<HotkeyEvent>,
     engine: Guard,
 }
 
 impl HotkeyManager {
     pub fn new() -> Self {
-        let registered = Arc::new(Mutex::new(HashMap::new()));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
-        let registered2 = registered.clone();
         let mut matcher = Matcher::default();
         let engine = crate::start(move |event| {
-            // The match itself is allocation-free and the lock is held only for
-            // its duration; registration writes are rare and tiny.
-            let (events, swallow) = {
-                let guard = registered2.lock().unwrap();
-                matcher.handle(&event, &guard)
-            };
+            // Pending registrations are applied before the match, so they
+            // take effect on the very next event — with no locking on the
+            // tap thread, per the callback contract.
+            while let Ok(command) = cmd_rx.try_recv() {
+                match command {
+                    Command::Register(id, reg) => matcher.register(id, reg),
+                    Command::Unregister(id) => matcher.unregister(id),
+                }
+            }
+            let (events, swallow) = matcher.handle(&event);
             for e in events {
                 let _ = tx.send(e);
             }
             swallow
         });
         Self {
-            registered,
-            next_id: AtomicU32::new(0),
+            commands: cmd_tx,
+            registry: Mutex::new(Registry::default()),
             rx,
             engine,
         }
@@ -50,18 +66,28 @@ impl HotkeyManager {
 
     /// Register a hotkey. Ids are unique per manager and never reused.
     pub fn register(&self, hotkey: Hotkey, suppression: Suppression) -> HotkeyId {
-        let id = HotkeyId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.registered
-            .lock()
-            .unwrap()
-            .insert(id, Registered { hotkey, suppression });
+        // The send stays inside the lock so the channel order always matches
+        // the live-set order, even with concurrent register/unregister calls.
+        let mut registry = self.registry.lock().unwrap();
+        let id = HotkeyId(registry.next_id);
+        registry.next_id += 1;
+        registry.live.insert(id);
+        let _ = self
+            .commands
+            .send(Command::Register(id, Registered { hotkey, suppression }));
         id
     }
 
     /// Remove a registration. Returns false if the id is unknown. An active
     /// hotkey that is unregistered simply never fires Up.
     pub fn unregister(&self, id: HotkeyId) -> bool {
-        self.registered.lock().unwrap().remove(&id).is_some()
+        let mut registry = self.registry.lock().unwrap();
+        if registry.live.remove(&id) {
+            let _ = self.commands.send(Command::Unregister(id));
+            true
+        } else {
+            false
+        }
     }
 
     /// Channel of hotkey activations. Use `recv` to block or `try_recv` to poll.

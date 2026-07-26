@@ -122,6 +122,21 @@ pub enum Key {
     Unknown(u16),
 }
 
+impl Key {
+    /// The side-agnostic modifier group a side-specific modifier key belongs
+    /// to, if any. Caps Lock (a toggle state, not a held modifier) and Fn
+    /// (sideless) have no group.
+    pub(crate) fn modifier_group(self) -> Option<Modifiers> {
+        Some(match self {
+            Key::ShiftLeft | Key::ShiftRight => Modifiers::SHIFT,
+            Key::ControlLeft | Key::ControlRight => Modifiers::CONTROL,
+            Key::OptionLeft | Key::OptionRight => Modifiers::OPTION,
+            Key::CommandLeft | Key::CommandRight => Modifiers::COMMAND,
+            _ => return None,
+        })
+    }
+}
+
 /// Whether a key was pressed or released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyEventKind {

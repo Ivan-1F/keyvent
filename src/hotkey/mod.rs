@@ -89,20 +89,27 @@ impl Hotkey {
         }
         matches!(modifier_bit_of(key), Some(bit) if self.modifiers.contains(bit))
     }
+
+    /// True if a press carrying `snapshot` satisfies the modifier requirement.
+    /// A modifier trigger (e.g. `OptionRight`) contributes its own group bit
+    /// to the snapshot by definition, so the REST is matched exactly — the
+    /// constructor has already stripped that bit from `modifiers`.
+    fn modifiers_match(&self, snapshot: Modifiers) -> bool {
+        let own = self
+            .key
+            .and_then(modifier_bit_of)
+            .unwrap_or(Modifiers::NONE);
+        modifiers_exact(snapshot - own, self.modifiers)
+    }
 }
 
-/// The side-agnostic modifier group a modifier key belongs to, if any.
-///
-/// Caps Lock is deliberately excluded: its snapshot bit means "locked", not
-/// "held", so it only makes sense as a trigger key.
-pub(crate) fn modifier_bit_of(key: Key) -> Option<Modifiers> {
+/// The modifier group a key belongs to, for hotkey matching: the sided
+/// groups plus sideless Fn. Caps Lock is deliberately excluded: its snapshot
+/// bit means "locked", not "held", so it only makes sense as a trigger key.
+fn modifier_bit_of(key: Key) -> Option<Modifiers> {
     match key {
-        Key::ShiftLeft | Key::ShiftRight => Some(Modifiers::SHIFT),
-        Key::ControlLeft | Key::ControlRight => Some(Modifiers::CONTROL),
-        Key::OptionLeft | Key::OptionRight => Some(Modifiers::OPTION),
-        Key::CommandLeft | Key::CommandRight => Some(Modifiers::COMMAND),
         Key::Function => Some(Modifiers::FN),
-        _ => None,
+        _ => key.modifier_group(),
     }
 }
 
@@ -117,7 +124,7 @@ pub enum Suppression {
 
 /// Opaque identifier of a registered hotkey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HotkeyId(pub u32);
+pub struct HotkeyId(u32);
 
 /// A hotkey activation or deactivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +145,7 @@ impl HotkeyEvent {
 
 /// Modifier bits relevant for matching. Caps Lock is excluded: it is a toggle
 /// state, not a held modifier, and must not affect hotkey matching.
-pub(crate) const MATCH_BITS: Modifiers = Modifiers::SHIFT
+const MATCH_BITS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::CONTROL)
     .union(Modifiers::OPTION)
     .union(Modifiers::COMMAND)
@@ -146,13 +153,8 @@ pub(crate) const MATCH_BITS: Modifiers = Modifiers::SHIFT
 
 /// Exact match: the event's modifiers (restricted to match bits) equal the
 /// hotkey's required set.
-pub(crate) fn modifiers_exact(snapshot: Modifiers, required: Modifiers) -> bool {
+fn modifiers_exact(snapshot: Modifiers, required: Modifiers) -> bool {
     snapshot & MATCH_BITS == required
-}
-
-/// Set membership: the event's modifiers still contain everything required.
-pub(crate) fn modifiers_still_held(snapshot: Modifiers, required: Modifiers) -> bool {
-    snapshot.contains(required)
 }
 
 #[cfg(test)]
@@ -208,12 +210,5 @@ mod tests {
             h.modifiers()
         ));
         assert!(modifiers_exact(Modifiers::COMMAND, h.modifiers()));
-    }
-
-    #[test]
-    fn still_held_is_membership_not_exactness() {
-        let required = Modifiers::OPTION;
-        assert!(modifiers_still_held(Modifiers::OPTION | Modifiers::SHIFT, required));
-        assert!(!modifiers_still_held(Modifiers::SHIFT, required));
     }
 }

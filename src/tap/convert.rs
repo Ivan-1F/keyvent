@@ -43,17 +43,19 @@ impl SideState {
 
 /// Maps a modifier `Key` to (its side bit, its group's aggregate snapshot bit).
 fn side_of(key: Key) -> Option<(SideState, Modifiers)> {
-    Some(match key {
-        Key::ShiftLeft => (SideState::SHIFT_L, Modifiers::SHIFT),
-        Key::ShiftRight => (SideState::SHIFT_R, Modifiers::SHIFT),
-        Key::ControlLeft => (SideState::CONTROL_L, Modifiers::CONTROL),
-        Key::ControlRight => (SideState::CONTROL_R, Modifiers::CONTROL),
-        Key::OptionLeft => (SideState::OPTION_L, Modifiers::OPTION),
-        Key::OptionRight => (SideState::OPTION_R, Modifiers::OPTION),
-        Key::CommandLeft => (SideState::COMMAND_L, Modifiers::COMMAND),
-        Key::CommandRight => (SideState::COMMAND_R, Modifiers::COMMAND),
+    let group = key.modifier_group()?;
+    let side = match key {
+        Key::ShiftLeft => SideState::SHIFT_L,
+        Key::ShiftRight => SideState::SHIFT_R,
+        Key::ControlLeft => SideState::CONTROL_L,
+        Key::ControlRight => SideState::CONTROL_R,
+        Key::OptionLeft => SideState::OPTION_L,
+        Key::OptionRight => SideState::OPTION_R,
+        Key::CommandLeft => SideState::COMMAND_L,
+        Key::CommandRight => SideState::COMMAND_R,
         _ => return None,
-    })
+    };
+    Some((side, group))
 }
 
 /// Tracks side-specific modifier state across events. Tap-thread local.
