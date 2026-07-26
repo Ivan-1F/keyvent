@@ -6,7 +6,8 @@
 //! uniform Press/Release events with side-specific keys we track per-side held
 //! state, and reconcile it against the aggregate snapshot on every event:
 //!
-//! - aggregate bit clear -> both sides are up (clears drift from missed events);
+//! - aggregate bit clear -> both sides are up (clears drift from missed
+//!   events);
 //! - aggregate bit set but no side tracked -> fall back to the left side.
 //!
 //! Caps Lock and Fn need no tracking: their flags (`MaskAlphaShift`,
@@ -142,9 +143,17 @@ impl ModifierTracker {
     pub(crate) fn reconcile(&mut self, snapshot: Modifiers, skip: Option<Modifiers>) {
         const GROUPS: [(Modifiers, SideState, SideState); 4] = [
             (Modifiers::SHIFT, SideState::SHIFT_L, SideState::SHIFT_R),
-            (Modifiers::CONTROL, SideState::CONTROL_L, SideState::CONTROL_R),
+            (
+                Modifiers::CONTROL,
+                SideState::CONTROL_L,
+                SideState::CONTROL_R,
+            ),
             (Modifiers::OPTION, SideState::OPTION_L, SideState::OPTION_R),
-            (Modifiers::COMMAND, SideState::COMMAND_L, SideState::COMMAND_R),
+            (
+                Modifiers::COMMAND,
+                SideState::COMMAND_L,
+                SideState::COMMAND_R,
+            ),
         ];
         for (group, left, right) in GROUPS {
             if skip == Some(group) {
@@ -243,7 +252,10 @@ mod tests {
         let down = convert(63, false, Modifiers::FN, &mut t, RawKind::FlagsChanged);
         assert_eq!(down, ev(Key::Function, KeyEventKind::Press, Modifiers::FN));
         let up = convert(63, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
-        assert_eq!(up, ev(Key::Function, KeyEventKind::Release, Modifiers::NONE));
+        assert_eq!(
+            up,
+            ev(Key::Function, KeyEventKind::Release, Modifiers::NONE)
+        );
     }
 
     #[test]
@@ -274,7 +286,8 @@ mod tests {
         let _ = convert(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         // Its release is LOST (e.g. tap timeout). Next plain event has SHIFT clear.
         let _ = convert(0, false, Modifiers::NONE, &mut t, RawKind::Down);
-        // Tracker must have cleared: a subsequent ShiftLeft FlagsChanged is a Press again.
+        // Tracker must have cleared: a subsequent ShiftLeft FlagsChanged is a Press
+        // again.
         let e = convert(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
     }
@@ -305,15 +318,30 @@ mod tests {
         // zone. No assume-left has fired yet (no plain event seen).
         // The user releases it: aggregate clears -> deterministic Release.
         let e = convert(55, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
-        assert_eq!(e, ev(Key::CommandLeft, KeyEventKind::Release, Modifiers::NONE));
+        assert_eq!(
+            e,
+            ev(Key::CommandLeft, KeyEventKind::Release, Modifiers::NONE)
+        );
     }
 
     #[test]
     fn caps_lock_from_flags() {
         let mut t = ModifierTracker::default();
-        let on = convert(57, false, Modifiers::CAPS_LOCK, &mut t, RawKind::FlagsChanged);
-        assert_eq!(on, ev(Key::CapsLock, KeyEventKind::Press, Modifiers::CAPS_LOCK));
+        let on = convert(
+            57,
+            false,
+            Modifiers::CAPS_LOCK,
+            &mut t,
+            RawKind::FlagsChanged,
+        );
+        assert_eq!(
+            on,
+            ev(Key::CapsLock, KeyEventKind::Press, Modifiers::CAPS_LOCK)
+        );
         let off = convert(57, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
-        assert_eq!(off, ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE));
+        assert_eq!(
+            off,
+            ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE)
+        );
     }
 }

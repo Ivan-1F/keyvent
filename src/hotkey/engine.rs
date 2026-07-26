@@ -10,9 +10,9 @@
 //! - Trigger hotkey: Down when the trigger is pressed with an exact modifier
 //!   match; Up when the trigger is released. Modifier drift mid-hold does not
 //!   end it.
-//! - Modifier-only hotkey: Down when the snapshot first equals the required
-//!   set exactly; Up when the snapshot no longer contains the full set
-//!   (extra modifiers pressed mid-hold do not end it).
+//! - Modifier-only hotkey: Down when the snapshot first equals the required set
+//!   exactly; Up when the snapshot no longer contains the full set (extra
+//!   modifiers pressed mid-hold do not end it).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -135,7 +135,13 @@ mod tests {
 
     fn matcher_with(id: HotkeyId, hotkey: Hotkey, suppression: Suppression) -> Matcher {
         let mut m = Matcher::default();
-        m.register(id, Registered { hotkey, suppression });
+        m.register(
+            id,
+            Registered {
+                hotkey,
+                suppression,
+            },
+        );
         m
     }
 
@@ -164,7 +170,11 @@ mod tests {
         let (events, _) = m.handle(&repeat(Key::KeyK, Modifiers::COMMAND));
         assert!(events.is_empty());
         // Modifier drifts mid-hold (Cmd released first): still active, no Up.
-        let (events, _) = m.handle(&ev(Key::CommandLeft, KeyEventKind::Release, Modifiers::NONE));
+        let (events, _) = m.handle(&ev(
+            Key::CommandLeft,
+            KeyEventKind::Release,
+            Modifiers::NONE,
+        ));
         assert!(events.is_empty());
         // K released: Up.
         let (events, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
@@ -209,7 +219,8 @@ mod tests {
             Suppression::Swallow,
         );
         // Option down (snapshot OPTION): Down + swallow.
-        let (events, swallow) = m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, swallow) =
+            m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
         // Typing while held: no transition, no swallow (unrelated key).
@@ -265,8 +276,11 @@ mod tests {
             m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
         assert!(events.is_empty() && !swallow);
         // Right option: Down + swallow.
-        let (events, swallow) =
-            m.handle(&ev(Key::OptionRight, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, swallow) = m.handle(&ev(
+            Key::OptionRight,
+            KeyEventKind::Press,
+            Modifiers::OPTION,
+        ));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
         // Right released while left still held: Up.
@@ -302,7 +316,11 @@ mod tests {
         ));
         assert_eq!(events, vec![HotkeyEvent::Down(id2)]);
         // Plain RightOption now matches only the bare one.
-        let (events, _) = m.handle(&ev(Key::OptionRight, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, _) = m.handle(&ev(
+            Key::OptionRight,
+            KeyEventKind::Press,
+            Modifiers::OPTION,
+        ));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
     }
 }

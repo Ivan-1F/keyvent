@@ -3,8 +3,8 @@
 //! Design contract:
 //! - Every key on the keyboard — including modifiers and Fn/Globe — produces
 //!   uniform [`KeyEventKind::Press`] / [`KeyEventKind::Release`] events.
-//! - Every event carries a complete [`Modifiers`] snapshot taken from the OS
-//!   at event time. Consumers never need to mirror key state locally.
+//! - Every event carries a complete [`Modifiers`] snapshot taken from the OS at
+//!   event time. Consumers never need to mirror key state locally.
 //! - The snapshot is side-agnostic (the OS does not report sides in event
 //!   flags); side information is carried by [`KeyEvent::key`] itself, e.g. a
 //!   `Press` of [`Key::ShiftLeft`].

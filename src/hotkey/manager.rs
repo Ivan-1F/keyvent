@@ -73,9 +73,13 @@ impl HotkeyManager {
         let id = HotkeyId(registry.next_id);
         registry.next_id += 1;
         registry.live.insert(id);
-        let _ = self
-            .commands
-            .send(Command::Register(id, Registered { hotkey, suppression }));
+        let _ = self.commands.send(Command::Register(
+            id,
+            Registered {
+                hotkey,
+                suppression,
+            },
+        ));
         id
     }
 
@@ -91,7 +95,8 @@ impl HotkeyManager {
         }
     }
 
-    /// Channel of hotkey activations. Use `recv` to block or `try_recv` to poll.
+    /// Channel of hotkey activations. Use `recv` to block or `try_recv` to
+    /// poll.
     pub fn receiver(&self) -> &mpsc::Receiver<HotkeyEvent> {
         &self.rx
     }

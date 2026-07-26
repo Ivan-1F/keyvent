@@ -205,7 +205,11 @@ mod tests {
     fn roundtrip_is_total() {
         for code in 0..=u16::MAX {
             let key = key_from_code(code);
-            assert_eq!(code_from_key(key), Some(code), "roundtrip failed for {code}");
+            assert_eq!(
+                code_from_key(key),
+                Some(code),
+                "roundtrip failed for {code}"
+            );
         }
     }
 

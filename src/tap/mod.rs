@@ -50,7 +50,8 @@ const INSTALL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// F20: in the macOS keycode space but absent from most physical keyboards.
 const HEARTBEAT_KEYCODE: Keycode = 90;
-/// Marker in the high 32 bits of `kCGEventSourceUserData` for our own injected events.
+/// Marker in the high 32 bits of `kCGEventSourceUserData` for our own injected
+/// events.
 const MAGIC_HIGH: i64 = 0x4B56_5400_0000_0000;
 
 /// A registered user callback: event in, swallow decision out.
@@ -58,20 +59,22 @@ pub(crate) type BoxedCallback = Box<dyn FnMut(KeyEvent) -> bool + Send>;
 
 /// State shared between the tap thread and the supervisor thread.
 pub(crate) struct TapShared {
-    /// Live tap handle. The Mutex serializes the slot swap; the CF operations on
-    /// the handle itself (enable/invalidate) are documented thread-safe.
+    /// Live tap handle. The Mutex serializes the slot swap; the CF operations
+    /// on the handle itself (enable/invalidate) are documented thread-safe.
     handle: Mutex<Option<TapHandle>>,
     hb_sent: AtomicU32,
     hb_acked: AtomicU32,
     /// kCGEventTapDisabledByTimeout deliveries since spawn.
     timeouts: AtomicU32,
-    /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on this.
+    /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on
+    /// this.
     user_input_disabled: AtomicBool,
 }
 
 struct TapHandle(CFRetained<CFMachPort>);
 // CFMachPort refcounting is atomic and CGEventTapEnable/Invalidate are
-// documented callable from any thread; the Mutex in TapShared serializes the slot.
+// documented callable from any thread; the Mutex in TapShared serializes the
+// slot.
 unsafe impl Send for TapHandle {}
 unsafe impl Sync for TapHandle {}
 
@@ -231,11 +234,7 @@ fn thread_main(
 
         if ctx.tap.is_some() {
             unsafe {
-                CFRunLoop::run_in_mode(
-                    kCFRunLoopDefaultMode,
-                    RUN_LOOP_SLICE.as_secs_f64(),
-                    true,
-                )
+                CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, RUN_LOOP_SLICE.as_secs_f64(), true)
             };
             // Did the supervisor force-invalidate behind our back?
             if ctx.shared.handle.lock().unwrap().is_none() {
@@ -297,8 +296,9 @@ fn install(ctx: &mut Ctx) -> bool {
     ctx.hb_next = Instant::now();
     // Initialize modifier tracking from physical truth, so keys held while the
     // stream starts are tracked correctly instead of guessed later.
-    ctx.tracker
-        .init_from_physical(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
+    ctx.tracker.init_from_physical(|code| {
+        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+    });
     log::info!("keyvent: event tap installed");
     true
 }
@@ -309,8 +309,9 @@ fn install(ctx: &mut Ctx) -> bool {
 fn teardown(ctx: &mut Ctx) {
     // OS-side book: drop entries whose key is physically up so a later rebuild
     // doesn't force-swallow releases for presses the OS actually saw.
-    ctx.suppression
-        .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
+    ctx.suppression.reconcile(|code| {
+        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+    });
     // Consumer-side ledger: the stream ends here, close everything.
     let dangling = ctx.pairing.close_all();
     emit_synthetic_releases(ctx, dangling);
@@ -335,11 +336,12 @@ fn drop_local_tap(ctx: &mut Ctx) {
 /// stream continues, so only presses whose key is physically up are closed —
 /// keys still held stay open and close on their real release.
 fn reconcile_books(ctx: &mut Ctx) {
-    ctx.suppression
-        .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
-    let released = ctx
-        .pairing
-        .reconcile(|code| CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code));
+    ctx.suppression.reconcile(|code| {
+        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+    });
+    let released = ctx.pairing.reconcile(|code| {
+        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+    });
     emit_synthetic_releases(ctx, released);
 }
 
@@ -467,7 +469,8 @@ unsafe extern "C-unwind" fn raw_callback(
         _ => return event.as_ptr(),
     };
 
-    let keycode = CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventKeycode) as Keycode;
+    let keycode =
+        CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventKeycode) as Keycode;
     let is_repeat = kind == RawKind::Down
         && CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventAutorepeat) != 0;
     let snapshot = modifiers_from_cg(CGEvent::flags(Some(cg)));

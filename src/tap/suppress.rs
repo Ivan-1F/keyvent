@@ -11,9 +11,8 @@
 //! - The *release* decision is derived, never asked: it follows whatever the
 //!   press did.
 //! - Key repeats are free: swallowing them is harmless (the OS just sees fewer
-//!   repeated KeyDowns), so the callback decides per repeat — but repeats
-//!   never create bookkeeping entries, so they cannot corrupt the release
-//!   decision.
+//!   repeated KeyDowns), so the callback decides per repeat — but repeats never
+//!   create bookkeeping entries, so they cannot corrupt the release decision.
 //!
 //! After an event-stream interruption (tap timeout, teardown), presses may
 //! have lost their releases. [`Suppression::reconcile`] compares the book

@@ -5,7 +5,8 @@
 //!
 //! - **tap_create probe** (every 1s): ground truth for "can this process filter
 //!   keyboard events right now". NULL = no.
-//! - **heartbeat echo**: end-to-end proof that the tap + callback path is alive.
+//! - **heartbeat echo**: end-to-end proof that the tap + callback path is
+//!   alive.
 //!
 //! Revocation = heartbeat lost AND probe NULL. A lost heartbeat with a healthy
 //! probe is transient (secure input, screen lock, sleep/wake, inert tap) and is
@@ -15,7 +16,7 @@
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,8 @@ fn secure_input_active() -> bool {
     unsafe { IsSecureEventInputEnabled() }
 }
 
-/// Create + immediately invalidate a throwaway tap: the functional permission probe.
+/// Create + immediately invalidate a throwaway tap: the functional permission
+/// probe.
 fn probe_tap() -> bool {
     unsafe extern "C-unwind" fn noop(
         _proxy: objc2_core_graphics::CGEventTapProxy,
@@ -93,9 +95,7 @@ enum State {
         acked_at_entry: u32,
     },
     /// Recovery budget exhausted; doing nothing but probing.
-    Cooldown {
-        until: Instant,
-    },
+    Cooldown { until: Instant },
 }
 
 pub(crate) struct Supervisor {
@@ -284,7 +284,9 @@ fn supervise(
                         } else if entered.elapsed() > SUSPICION_GRACE {
                             // Rebuild didn't restore the echo: count a cycle, retry.
                             cycles += 1;
-                            log::warn!("keyvent: rebuild did not restore heartbeat (cycle {cycles})");
+                            log::warn!(
+                                "keyvent: rebuild did not restore heartbeat (cycle {cycles})"
+                            );
                             if cycles >= MAX_RECOVERY_CYCLES {
                                 state = State::Cooldown {
                                     until: now + COOLDOWN_DURATION,
