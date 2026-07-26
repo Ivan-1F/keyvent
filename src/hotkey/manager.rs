@@ -1,6 +1,6 @@
-//! `HotkeyManager`: the high-level entry point. Owns a keyvent engine whose
-//! callback is the matching engine; consumers receive `HotkeyEvent`s over a
-//! channel — no user code ever runs on the tap thread.
+//! `HotkeyManager`: the high-level entry point. Runs its matching engine as
+//! one callback in the shared keyvent engine; consumers receive `HotkeyEvent`s
+//! over a channel — no user code ever runs on the tap thread.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, mpsc};
@@ -26,8 +26,9 @@ struct Registry {
 
 /// Registers hotkeys and delivers their activations over a channel.
 ///
-/// Each manager owns an independent engine (tap thread + supervisor). Create
-/// one per application.
+/// Managers share the process-wide keyvent engine (see [`crate::start`]);
+/// each manager's registrations and events are routed independently, and
+/// [`HotkeyId`]s only need to be unique per manager.
 pub struct HotkeyManager {
     commands: mpsc::Sender<Command>,
     registry: Mutex<Registry>,

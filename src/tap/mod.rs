@@ -53,6 +53,9 @@ const HEARTBEAT_KEYCODE: Keycode = 90;
 /// Marker in the high 32 bits of `kCGEventSourceUserData` for our own injected events.
 const MAGIC_HIGH: i64 = 0x4B56_5400_0000_0000;
 
+/// A registered user callback: event in, swallow decision out.
+pub(crate) type BoxedCallback = Box<dyn FnMut(KeyEvent) -> bool + Send>;
+
 /// State shared between the tap thread and the supervisor thread.
 pub(crate) struct TapShared {
     /// Live tap handle. The Mutex serializes the slot swap; the CF operations on
@@ -64,8 +67,6 @@ pub(crate) struct TapShared {
     timeouts: AtomicU32,
     /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on this.
     user_input_disabled: AtomicBool,
-    /// User-callback panics caught at the FFI boundary.
-    callback_panics: AtomicU32,
 }
 
 struct TapHandle(CFRetained<CFMachPort>);
@@ -82,7 +83,6 @@ impl TapShared {
             hb_acked: AtomicU32::new(0),
             timeouts: AtomicU32::new(0),
             user_input_disabled: AtomicBool::new(false),
-            callback_panics: AtomicU32::new(0),
         }
     }
 
@@ -131,10 +131,7 @@ pub(crate) struct TapThread {
 }
 
 impl TapThread {
-    pub(crate) fn spawn(
-        callback: Box<dyn FnMut(KeyEvent) -> bool + Send>,
-        shared: Arc<TapShared>,
-    ) -> Self {
+    pub(crate) fn spawn(callback: BoxedCallback, shared: Arc<TapShared>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("keyvent-tap".into())
@@ -192,7 +189,7 @@ pub(crate) fn join_with_timeout(join: JoinHandle<()>, timeout: Duration, name: &
 /// The callback receives a raw pointer to this via user_info; it is valid for
 /// the whole lifetime of the run loop.
 struct Ctx {
-    callback: Box<dyn FnMut(KeyEvent) -> bool + Send>,
+    callback: BoxedCallback,
     tracker: ModifierTracker,
     suppression: Suppression,
     pairing: Pairing,
@@ -204,7 +201,7 @@ struct Ctx {
 }
 
 fn thread_main(
-    callback: Box<dyn FnMut(KeyEvent) -> bool + Send>,
+    callback: BoxedCallback,
     shared: Arc<TapShared>,
     cmd_rx: mpsc::Receiver<TapCommand>,
 ) {
@@ -358,14 +355,15 @@ fn emit_synthetic_releases(ctx: &mut Ctx, codes: Vec<Keycode>) {
     }
 }
 
-/// Dispatch one event to the user callback with panic isolation.
-/// Returns the callback's swallow decision (false on panic).
+/// Dispatch one event to the callback. Last-resort FFI boundary: the
+/// dispatcher isolates user-callback panics itself, so this only catches
+/// panics in the dispatch machinery — which must never unwind into the
+/// CF run loop. Returns the callback's swallow decision (false on panic).
 fn dispatch(ctx: &mut Ctx, event: KeyEvent) -> bool {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ctx.callback)(event))) {
         Ok(swallow) => swallow,
         Err(_) => {
-            ctx.shared.callback_panics.fetch_add(1, SeqCst);
-            log::error!("keyvent: user callback panicked; event passed through");
+            log::error!("keyvent: callback dispatch panicked; event passed through");
             false
         }
     }

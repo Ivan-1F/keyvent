@@ -15,7 +15,7 @@
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -108,15 +108,14 @@ impl Supervisor {
     pub(crate) fn spawn(
         tap: TapThread,
         shared: Arc<TapShared>,
-        status: Arc<AtomicU8>,
-        status_tx: mpsc::SyncSender<Status>,
+        broadcast: Arc<StatusBroadcast>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
         let shared2 = shared.clone();
         let join = thread::Builder::new()
             .name("keyvent-supervisor".into())
-            .spawn(move || supervise(tap, shared, status, status_tx, shutdown2))
+            .spawn(move || supervise(tap, shared, broadcast, shutdown2))
             .expect("spawn keyvent-supervisor thread");
         Self {
             shutdown,
@@ -136,38 +135,62 @@ impl Supervisor {
     }
 }
 
-/// Record a status transition: update the atomic current-value cell and queue
-/// the change for subscribers. A full channel drops the change silently —
-/// `Guard::status()` always reflects the latest state regardless.
-fn announce(
-    status: &Arc<AtomicU8>,
-    status_tx: &mpsc::SyncSender<Status>,
-    current: &mut Status,
-    next: Status,
-) {
-    if *current == next {
-        return;
-    }
-    log::info!("keyvent: status {current:?} -> {next:?}");
-    *current = next;
-    status.store(next as u8, SeqCst);
-    let _ = status_tx.try_send(next);
+/// Fan-out of lifecycle status changes: a current-value cell plus a list of
+/// bounded subscriber channels. The supervisor is the only publisher.
+pub(crate) struct StatusBroadcast {
+    current: AtomicU8,
+    subscribers: Mutex<Vec<mpsc::SyncSender<Status>>>,
 }
 
-#[allow(clippy::too_many_arguments)]
+impl StatusBroadcast {
+    pub(crate) fn new(initial: Status) -> Self {
+        Self {
+            current: AtomicU8::new(initial as u8),
+            subscribers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Current lifecycle status.
+    pub(crate) fn current(&self) -> Status {
+        Status::from_u8(self.current.load(SeqCst))
+    }
+
+    /// A new subscriber channel. Bounded: if nobody drains it, new statuses
+    /// are dropped rather than queueing forever — `current()` always has the
+    /// latest value.
+    pub(crate) fn subscribe(&self) -> mpsc::Receiver<Status> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        self.subscribers.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// Publish a status change: update the current-value cell and queue the
+    /// change for all subscribers. No-op if the status is unchanged. A full
+    /// channel drops the change silently; subscribers whose receiver is gone
+    /// (guard dropped) are pruned lazily.
+    pub(crate) fn publish(&self, next: Status) {
+        let prev = self.current.swap(next as u8, SeqCst);
+        if prev == next as u8 {
+            return;
+        }
+        log::info!("keyvent: status {:?} -> {next:?}", Status::from_u8(prev));
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.retain(|tx| match tx.try_send(next) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        });
+    }
+}
+
 fn supervise(
     tap: TapThread,
     shared: Arc<TapShared>,
-    status: Arc<AtomicU8>,
-    status_tx: mpsc::SyncSender<Status>,
+    broadcast: Arc<StatusBroadcast>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut state = State::Silent;
-    let mut current_status = Status::Silent;
     let mut probe_due = Instant::now(); // probe immediately on start
     let mut cycles = 0u32;
-
-    announce(&status, &status_tx, &mut current_status, Status::Silent);
 
     while !shutdown.load(SeqCst) {
         std::thread::sleep(TICK);
@@ -185,10 +208,10 @@ fn supervise(
                 if probed == Some(true) && tap.install() {
                     cycles = 0;
                     state = State::Running;
-                    announce(&status, &status_tx, &mut current_status, Status::Running);
+                    broadcast.publish(Status::Running);
                     continue;
                 }
-                announce(&status, &status_tx, &mut current_status, Status::Silent);
+                broadcast.publish(Status::Silent);
             }
 
             State::Running => {
@@ -233,7 +256,7 @@ fn supervise(
                         tap.teardown();
                         cycles = 0;
                         state = State::Silent;
-                        announce(&status, &status_tx, &mut current_status, Status::Silent);
+                        broadcast.publish(Status::Silent);
                     }
                     Some(true) => {
                         if secure_input_active() {
@@ -255,7 +278,7 @@ fn supervise(
                                     state = State::Cooldown {
                                         until: now + COOLDOWN_DURATION,
                                     };
-                                    announce(&status, &status_tx, &mut current_status, Status::Cooldown);
+                                    broadcast.publish(Status::Cooldown);
                                 }
                             }
                         } else if entered.elapsed() > SUSPICION_GRACE {
@@ -266,7 +289,7 @@ fn supervise(
                                 state = State::Cooldown {
                                     until: now + COOLDOWN_DURATION,
                                 };
-                                announce(&status, &status_tx, &mut current_status, Status::Cooldown);
+                                broadcast.publish(Status::Cooldown);
                             } else {
                                 *rebuilt = false;
                                 *entered = now;
@@ -285,7 +308,7 @@ fn supervise(
                     log::info!("keyvent: cooldown over; resuming normal operation");
                     cycles = 0;
                     state = State::Silent;
-                    announce(&status, &status_tx, &mut current_status, Status::Silent);
+                    broadcast.publish(Status::Silent);
                 }
             }
         }

@@ -38,6 +38,8 @@ let guard = keyvent::start(|event| {
 `start` returns immediately in all cases, including when permission is missing.
 Drop the returned `Guard` to stop.
 
+All `start` calls share one process-wide engine (a single event tap): each call registers an additional callback, an event is suppressed if any callback returns `true`, and the engine shuts down when the last `Guard` is dropped.
+
 Suppression (returning `true`) is only consulted for presses; releases always follow the press decision.
 
 To observe the permission lifecycle:
