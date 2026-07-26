@@ -32,6 +32,7 @@
 //! with a phantom release or a stuck key.
 
 mod event;
+pub mod hotkey;
 mod keycode;
 mod supervisor;
 mod tap;
@@ -41,6 +42,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::{mpsc, Arc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
+pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
 
 /// Lifecycle status of the event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -185,6 +185,11 @@ impl Modifiers {
     pub(crate) const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
+
+    /// Bitflags-style union, usable in const contexts.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl BitOr for Modifiers {
