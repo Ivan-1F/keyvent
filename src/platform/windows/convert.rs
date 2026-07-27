@@ -3,11 +3,10 @@
 //! The hook reports side-specific press/release per key directly, so no side
 //! inference is needed (unlike macOS `FlagsChanged`). But it carries no
 //! modifier snapshot and no autorepeat flag, so both are self-tracked here:
-//! the snapshot folds the currently-held modifier keys (plus the Caps Lock
-//! toggle, flipped on each press), and a press arriving for an already-held
-//! key is a repeat. A duplicate modifier press is dropped instead of
-//! reported: macOS never emits one, and reporting it would let suppression
-//! re-decide an already-booked press cycle.
+//! the snapshot folds the currently-held modifier keys, and a press arriving
+//! for an already-held key is a repeat. A duplicate modifier press is dropped
+//! instead of reported: macOS never emits one, and reporting it would let
+//! suppression re-decide an already-booked press cycle.
 
 use std::collections::HashSet;
 
@@ -19,7 +18,6 @@ use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
 #[derive(Default)]
 pub(crate) struct Tracker {
     pressed: HashSet<Key>,
-    caps_lock_on: bool,
 }
 
 impl Tracker {
@@ -32,10 +30,6 @@ impl Tracker {
         let mut is_repeat = false;
         let kind = if down {
             if self.pressed.insert(key) {
-                // Only a fresh press may flip the toggle.
-                if key == Key::CapsLock {
-                    self.caps_lock_on = !self.caps_lock_on;
-                }
                 KeyEventKind::Press
             } else if key.modifier_group().is_some() {
                 return None;
@@ -58,13 +52,8 @@ impl Tracker {
     /// Seeds tracked state at install time from physical key state, so keys
     /// held while the stream starts are tracked truthfully: their in-flight
     /// autorepeats read as repeats, not fresh presses.
-    pub(crate) fn init_from_physical(
-        &mut self,
-        is_held: impl Fn(Keycode) -> bool,
-        caps_lock_on: bool,
-    ) {
+    pub(crate) fn init_from_physical(&mut self, is_held: impl Fn(Keycode) -> bool) {
         self.pressed.clear();
-        self.caps_lock_on = caps_lock_on;
         for code in keycode::all_codes() {
             if is_held(code) {
                 self.pressed.insert(keycode::key_from_code(code));
@@ -73,10 +62,7 @@ impl Tracker {
     }
 
     fn snapshot(&self) -> Modifiers {
-        let mut snapshot = match self.caps_lock_on {
-            true => Modifiers::CAPS_LOCK,
-            false => Modifiers::NONE,
-        };
+        let mut snapshot = Modifiers::NONE;
         for &key in &self.pressed {
             if let Some(group) = key.modifier_group() {
                 snapshot |= group;
@@ -177,35 +163,19 @@ mod tests {
     }
 
     #[test]
-    fn caps_lock_snapshot_is_toggle_state() {
+    fn caps_lock_is_a_plain_key() {
         let mut t = Tracker::default();
-        // Pressing flips the toggle on; the bit stays set after release
-        // (it means "locked", not "held").
-        let e = t.convert(0x3A, true).unwrap();
-        assert_eq!(
-            e,
-            ev(
-                Key::CapsLock,
-                KeyEventKind::Press,
-                Modifiers::CAPS_LOCK,
-                false
-            )
-        );
-        let e = t.convert(0x3A, false).unwrap();
-        assert_eq!(
-            e,
-            ev(
-                Key::CapsLock,
-                KeyEventKind::Release,
-                Modifiers::CAPS_LOCK,
-                false
-            )
-        );
-        // Pressing again flips it off.
+        // Caps Lock produces plain press/release events and never leaks into
+        // the snapshot.
         let e = t.convert(0x3A, true).unwrap();
         assert_eq!(
             e,
             ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE, false)
+        );
+        let e = t.convert(0x3A, false).unwrap();
+        assert_eq!(
+            e,
+            ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE, false)
         );
     }
 
@@ -222,17 +192,16 @@ mod tests {
     #[test]
     fn init_from_physical_seeds_held_keys() {
         let mut t = Tracker::default();
-        // ControlLeft, AltRight and KeyA are physically held at install time;
-        // caps lock is on.
-        t.init_from_physical(|code| matches!(code, 0x1D | 0xE038 | 0x1E), true);
-        // The snapshot reflects the seeded modifiers and the toggle.
+        // ControlLeft, AltRight and KeyA are physically held at install time.
+        t.init_from_physical(|code| matches!(code, 0x1D | 0xE038 | 0x1E));
+        // The snapshot reflects the seeded modifiers.
         let e = t.convert(0x1F, true).unwrap();
         assert_eq!(
             e,
             ev(
                 Key::KeyS,
                 KeyEventKind::Press,
-                Modifiers::CONTROL | Modifiers::ALT | Modifiers::CAPS_LOCK,
+                Modifiers::CONTROL | Modifiers::ALT,
                 false
             )
         );
@@ -248,7 +217,7 @@ mod tests {
             ev(
                 Key::ControlLeft,
                 KeyEventKind::Release,
-                Modifiers::ALT | Modifiers::CAPS_LOCK,
+                Modifiers::ALT,
                 false
             )
         );
