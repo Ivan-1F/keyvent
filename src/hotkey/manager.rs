@@ -14,14 +14,26 @@ use super::{Hotkey, HotkeyEvent, HotkeyId, Suppression};
 enum Command {
     Register(HotkeyId, Registered),
     Unregister(HotkeyId),
+    SetEnabled(bool),
 }
 
-/// User-thread registration state: id allocation and the live id set (for
-/// `unregister`'s return value). The tap thread never touches it.
-#[derive(Default)]
+/// User-thread registration state: id allocation, the live id set (for
+/// `unregister`'s return value), and the enabled flag. The tap thread never
+/// touches it.
 struct Registry {
     next_id: u32,
     live: HashSet<HotkeyId>,
+    enabled: bool,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            live: HashSet::new(),
+            enabled: true,
+        }
+    }
 }
 
 /// Registers hotkeys and delivers their activations over a channel.
@@ -49,6 +61,7 @@ impl HotkeyManager {
                 match command {
                     Command::Register(id, reg) => matcher.register(id, reg),
                     Command::Unregister(id) => matcher.unregister(id),
+                    Command::SetEnabled(enabled) => matcher.set_enabled(enabled),
                 }
             }
             let (events, swallow) = matcher.handle(&event);
@@ -93,6 +106,30 @@ impl HotkeyManager {
         } else {
             false
         }
+    }
+
+    /// Suspend matching: no new activations start and nothing is swallowed.
+    /// A hotkey already active still fires Up when released.
+    pub fn disable(&self) {
+        self.set_enabled(false);
+    }
+
+    /// Resume matching after [`disable`](Self::disable).
+    pub fn enable(&self) {
+        self.set_enabled(true);
+    }
+
+    /// Whether the manager is currently matching.
+    pub fn enabled(&self) -> bool {
+        self.registry.lock().unwrap().enabled
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        // The send stays inside the lock so the channel order always matches
+        // the flag order, even with concurrent enable/disable calls.
+        let mut registry = self.registry.lock().unwrap();
+        registry.enabled = enabled;
+        let _ = self.commands.send(Command::SetEnabled(enabled));
     }
 
     /// Channel of hotkey activations. Use `recv` to block or `try_recv` to

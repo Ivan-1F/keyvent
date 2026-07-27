@@ -28,12 +28,23 @@ pub(crate) struct Registered {
     pub suppression: Suppression,
 }
 
-#[derive(Default)]
 pub(crate) struct Matcher {
     /// Registered hotkeys by id.
     registered: HashMap<HotkeyId, Registered>,
     /// Active hotkeys and when they went down.
     active: HashMap<HotkeyId, Instant>,
+    /// When false, no new activations start and nothing is swallowed.
+    enabled: bool,
+}
+
+impl Default for Matcher {
+    fn default() -> Self {
+        Self {
+            registered: HashMap::new(),
+            active: HashMap::new(),
+            enabled: true,
+        }
+    }
 }
 
 impl Matcher {
@@ -48,6 +59,12 @@ impl Matcher {
         self.active.remove(&id);
     }
 
+    /// Suspend or resume matching. Suspension stops new activations and all
+    /// swallowing; in-flight activations still complete on release.
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     /// Process one event. Returns the hotkey events to emit and whether the
     /// raw event should be swallowed.
     pub(crate) fn handle(&mut self, event: &KeyEvent) -> (Vec<HotkeyEvent>, bool) {
@@ -59,7 +76,9 @@ impl Matcher {
                 Some(trigger) => {
                     if event.key == trigger && !event.is_repeat {
                         match event.kind {
-                            KeyEventKind::Press if !self.active.contains_key(id) => {
+                            KeyEventKind::Press
+                                if self.enabled && !self.active.contains_key(id) =>
+                            {
                                 if reg.hotkey.modifiers_match(event.modifiers) {
                                     self.active.insert(*id, Instant::now());
                                     out.push(HotkeyEvent::Down(*id));
@@ -72,7 +91,7 @@ impl Matcher {
                 }
                 None => {
                     if reg.hotkey.modifiers_match(event.modifiers) {
-                        if !self.active.contains_key(id) {
+                        if self.enabled && !self.active.contains_key(id) {
                             self.active.insert(*id, Instant::now());
                             out.push(HotkeyEvent::Down(*id));
                         }
@@ -87,6 +106,7 @@ impl Matcher {
             // For releases, the raw engine follows the press decision
             // regardless of what we return here.
             if !swallow
+                && self.enabled
                 && reg.suppression == Suppression::Swallow
                 && reg.hotkey.involves(event.key)
                 && self.active.contains_key(id)
@@ -322,5 +342,44 @@ mod tests {
             Modifiers::OPTION,
         ));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
+    }
+
+    #[test]
+    fn disabled_matcher_emits_nothing_and_swallows_nothing() {
+        let (id, mut m) = cmd_k(Suppression::Swallow);
+        m.set_enabled(false);
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        assert!(events.is_empty() && !swallow);
+        // Re-enabled: matching resumes.
+        m.set_enabled(true);
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        assert_eq!(events, vec![HotkeyEvent::Down(id)]);
+        assert!(swallow);
+    }
+
+    #[test]
+    fn disable_mid_hold_completes_on_release() {
+        let (id, mut m) = cmd_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        m.set_enabled(false);
+        // The in-flight activation completes on the real release.
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(events.as_slice(), [HotkeyEvent::Up { id: i, .. }] if *i == id));
+        assert!(!swallow);
+    }
+
+    #[test]
+    fn modifier_only_held_across_disable_cycle_does_not_refire() {
+        let id = HotkeyId(9);
+        let mut m = matcher_with(id, Hotkey::new(Modifiers::OPTION, None), Suppression::Pass);
+        m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
+        m.set_enabled(false);
+        m.set_enabled(true);
+        // Still held from before the cycle: no second Down.
+        let (events, _) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::OPTION));
+        assert!(events.is_empty());
+        // One hold, one Up.
+        let (events, _) = m.handle(&ev(Key::OptionLeft, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(events.as_slice(), [HotkeyEvent::Up { id: i, .. }] if *i == id));
     }
 }
