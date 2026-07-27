@@ -2,9 +2,16 @@
 
 Global keyboard event stream for macOS, with automatic Accessibility permission lifecycle management.
 
+## Install
+
+```toml
+[dependencies]
+keyvent = "0.1"
+```
+
 ## Usage
 
-```no_run
+```rust
 // This will return immediately.
 let guard = keyvent::start(|event| {
     // Return true to suppress the event system-wide.
