@@ -47,12 +47,13 @@ enum Command {
 /// Recorders share the process-wide keyvent engine (see [`crate::start`]).
 pub struct HotkeyRecorder {
     commands: mpsc::Sender<Command>,
-    rx: mpsc::Receiver<RecorderEvent>,
     engine: Guard,
 }
 
 impl HotkeyRecorder {
-    pub fn new() -> Self {
+    /// Returns the recorder and the channel of recording events (`recv` to
+    /// block, `try_recv` to poll).
+    pub fn new() -> (Self, mpsc::Receiver<RecorderEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let mut session = Session::new();
@@ -71,11 +72,13 @@ impl HotkeyRecorder {
             }
             swallow
         });
-        Self {
-            commands: cmd_tx,
+        (
+            Self {
+                commands: cmd_tx,
+                engine,
+            },
             rx,
-            engine,
-        }
+        )
     }
 
     /// Enter recording mode: all keyboard input is swallowed and the gesture
@@ -89,25 +92,14 @@ impl HotkeyRecorder {
         let _ = self.commands.send(Command::Cancel);
     }
 
-    /// Channel of recording events. Use `recv` to block or `try_recv` to poll.
-    pub fn receiver(&self) -> &mpsc::Receiver<RecorderEvent> {
-        &self.rx
-    }
-
     /// Permission lifecycle status of the underlying engine.
     pub fn status(&self) -> Status {
         self.engine.status()
     }
 
-    /// Stream of engine status changes.
-    pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
+    /// A new subscription to engine status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
         self.engine.status_receiver()
-    }
-}
-
-impl Default for HotkeyRecorder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

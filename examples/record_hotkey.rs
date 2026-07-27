@@ -13,8 +13,8 @@ use keyvent::{
 };
 
 fn main() {
-    let manager = HotkeyManager::new();
-    let recorder = HotkeyRecorder::new();
+    let (manager, manager_events) = HotkeyManager::new();
+    let (recorder, recorder_events) = HotkeyRecorder::new();
 
     if manager.status() != Status::Running {
         println!("Waiting for Accessibility permission…");
@@ -27,7 +27,7 @@ fn main() {
     recorder.start_recording();
 
     let hotkey = loop {
-        match recorder.receiver().recv().unwrap() {
+        match recorder_events.recv().unwrap() {
             // Live preview while the gesture builds.
             RecorderEvent::Candidate(h) => {
                 print!("\r\x1b[K> {hotkey}", hotkey = show(h));
@@ -54,7 +54,7 @@ fn main() {
         "Registered. Press {hotkey} anywhere (Ctrl+C quits).",
         hotkey = show(hotkey)
     );
-    while let Ok(event) = manager.receiver().recv() {
+    while let Ok(event) = manager_events.recv() {
         match event {
             HotkeyEvent::Down(_) => println!("down"),
             HotkeyEvent::Up { held_for, .. } => println!("up, held for {held_for:.2?}"),

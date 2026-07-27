@@ -113,7 +113,6 @@ impl Engine {
         Guard {
             _registration: registration,
             engine: self.clone(),
-            status_rx: self.broadcast.subscribe(),
         }
     }
 }
@@ -139,7 +138,6 @@ pub struct Guard {
     /// this token is gone.
     _registration: Arc<()>,
     engine: Arc<Engine>,
-    status_rx: mpsc::Receiver<Status>,
 }
 
 /// Start the global event stream.
@@ -204,9 +202,9 @@ impl Guard {
         self.engine.broadcast.current()
     }
 
-    /// Stream of status changes.
-    pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
-        &self.status_rx
+    /// A new subscription to status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
+        self.engine.broadcast.subscribe()
     }
 }
 

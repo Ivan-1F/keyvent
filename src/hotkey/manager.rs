@@ -44,12 +44,13 @@ impl Default for Registry {
 pub struct HotkeyManager {
     commands: mpsc::Sender<Command>,
     registry: Mutex<Registry>,
-    rx: mpsc::Receiver<HotkeyEvent>,
     engine: Guard,
 }
 
 impl HotkeyManager {
-    pub fn new() -> Self {
+    /// Returns the manager and the channel of hotkey activations (`recv` to
+    /// block, `try_recv` to poll).
+    pub fn new() -> (Self, mpsc::Receiver<HotkeyEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let mut matcher = Matcher::default();
@@ -70,12 +71,14 @@ impl HotkeyManager {
             }
             swallow
         });
-        Self {
-            commands: cmd_tx,
-            registry: Mutex::new(Registry::default()),
+        (
+            Self {
+                commands: cmd_tx,
+                registry: Mutex::new(Registry::default()),
+                engine,
+            },
             rx,
-            engine,
-        }
+        )
     }
 
     /// Register a hotkey. Ids are unique per manager and never reused.
@@ -132,25 +135,13 @@ impl HotkeyManager {
         let _ = self.commands.send(Command::SetEnabled(enabled));
     }
 
-    /// Channel of hotkey activations. Use `recv` to block or `try_recv` to
-    /// poll.
-    pub fn receiver(&self) -> &mpsc::Receiver<HotkeyEvent> {
-        &self.rx
-    }
-
     /// Permission lifecycle status of the underlying engine.
     pub fn status(&self) -> Status {
         self.engine.status()
     }
 
-    /// Stream of engine status changes.
-    pub fn status_receiver(&self) -> &mpsc::Receiver<Status> {
+    /// A new subscription to engine status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
         self.engine.status_receiver()
-    }
-}
-
-impl Default for HotkeyManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
