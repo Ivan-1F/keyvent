@@ -111,8 +111,8 @@ impl Hotkey {
 
 impl fmt::Display for Hotkey {
     /// `+`-joined modifiers and trigger key (e.g. `Shift+Super+K`). Modifier
-    /// bits outside the match set — notably Caps Lock — are written as a
-    /// `0x..` hex token so the form parses back.
+    /// bits outside the match set are written as a `0x..` hex token so the
+    /// form parses back.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<String> = Vec::new();
         let named = self.modifiers & MATCH_BITS;
@@ -179,8 +179,7 @@ impl fmt::Display for ParseHotkeyError {
 impl Error for ParseHotkeyError {}
 
 /// The modifier group a key belongs to, for hotkey matching: the sided
-/// groups plus sideless Fn. Caps Lock is deliberately excluded: its snapshot
-/// bit means "locked", not "held", so it only makes sense as a trigger key.
+/// groups plus sideless Fn.
 fn modifier_bit_of(key: Key) -> Option<Modifiers> {
     match key {
         Key::Function => Some(Modifiers::FN),
@@ -218,8 +217,7 @@ impl HotkeyEvent {
     }
 }
 
-/// Modifier bits relevant for matching. Caps Lock is excluded: it is a toggle
-/// state, not a held modifier, and must not affect hotkey matching.
+/// Modifier bits relevant for matching.
 const MATCH_BITS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::CONTROL)
     .union(Modifiers::ALT)
@@ -275,10 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_matching_ignores_caps_lock() {
+    fn exact_matching_ignores_unmatched_bits() {
         let h = Hotkey::new(Modifiers::SUPER, Some(Key::KeyK));
         assert!(modifiers_exact(
-            Modifiers::SUPER | Modifiers::CAPS_LOCK,
+            Modifiers::SUPER | Modifiers::from_bits(0x20),
             h.modifiers()
         ));
         assert!(!modifiers_exact(
@@ -298,8 +296,11 @@ mod tests {
             Hotkey::new(Modifiers::NONE, Some(Key::AltRight)),
             Hotkey::new(Modifiers::NONE, Some(Key::CapsLock)),
             Hotkey::new(Modifiers::SUPER, Some(Key::CapsLock)),
-            Hotkey::new(Modifiers::CAPS_LOCK, None),
-            Hotkey::new(Modifiers::CAPS_LOCK | Modifiers::SUPER, Some(Key::KeyK)),
+            Hotkey::new(Modifiers::from_bits(0x20), None),
+            Hotkey::new(
+                Modifiers::from_bits(0x20) | Modifiers::SUPER,
+                Some(Key::KeyK),
+            ),
             Hotkey::new(Modifiers::NONE, Some(Key::Unknown(0x5E))),
         ];
         for hotkey in hotkeys {
@@ -341,7 +342,10 @@ mod tests {
             Hotkey::new(Modifiers::NONE, Some(Key::Function)).to_string(),
             "Fn"
         );
-        assert_eq!(Hotkey::new(Modifiers::CAPS_LOCK, None).to_string(), "0x20");
+        assert_eq!(
+            Hotkey::new(Modifiers::from_bits(0x20), None).to_string(),
+            "0x20"
+        );
         assert_eq!(Hotkey::new(Modifiers::NONE, None).to_string(), "");
     }
 

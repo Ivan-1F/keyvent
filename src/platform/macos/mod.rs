@@ -378,9 +378,6 @@ fn modifiers_from_cg(flags: CGEventFlags) -> Modifiers {
     if flags.contains(CGEventFlags::MaskSecondaryFn) {
         bits |= Modifiers::FN.bits();
     }
-    if flags.contains(CGEventFlags::MaskAlphaShift) {
-        bits |= Modifiers::CAPS_LOCK.bits();
-    }
     Modifiers::from_bits(bits)
 }
 
@@ -457,14 +454,23 @@ unsafe extern "C-unwind" fn raw_callback(
         CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventKeycode) as Keycode;
     let is_repeat = kind == RawKind::Down
         && CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventAutorepeat) != 0;
-    let snapshot = modifiers_from_cg(CGEvent::flags(Some(cg)));
+    let flags = CGEvent::flags(Some(cg));
+    let snapshot = modifiers_from_cg(flags);
+    let caps_lock = flags.contains(CGEventFlags::MaskAlphaShift);
 
     // Swallow the globe-action event when its Fn cycle is being suppressed.
     if ctx.suppression.swallows_globe_action(keycode) {
         return null_mut();
     }
 
-    let key_event = convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind);
+    let key_event = convert::convert(
+        keycode,
+        is_repeat,
+        snapshot,
+        caps_lock,
+        &mut ctx.tracker,
+        kind,
+    );
 
     // Consumer side: pairing ledger decides what the callback may see.
     // OS side: suppression bookkeeping decides what happens to the raw event.

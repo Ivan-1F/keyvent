@@ -128,8 +128,7 @@ pub enum Key {
 
 impl Key {
     /// The side-agnostic modifier group a side-specific modifier key belongs
-    /// to, if any. Caps Lock (a toggle state, not a held modifier) and Fn
-    /// (sideless) have no group.
+    /// to, if any. Caps Lock and Fn (sideless) have no group.
     pub(crate) fn modifier_group(self) -> Option<Modifiers> {
         Some(match self {
             Key::ShiftLeft | Key::ShiftRight => Modifiers::SHIFT,
@@ -370,7 +369,6 @@ impl Modifiers {
     pub const SUPER: Self = Self(1 << 3);
     /// The Fn/Globe key (macOS only).
     pub const FN: Self = Self(1 << 4);
-    pub const CAPS_LOCK: Self = Self(1 << 5);
 
     pub const fn empty() -> Self {
         Self::NONE
@@ -452,13 +450,12 @@ impl Not for Modifiers {
 
 impl fmt::Debug for Modifiers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(Modifiers, &str); 6] = [
+        const NAMES: [(Modifiers, &str); 5] = [
             (Modifiers::SHIFT, "SHIFT"),
             (Modifiers::CONTROL, "CONTROL"),
             (Modifiers::ALT, "ALT"),
             (Modifiers::SUPER, "SUPER"),
             (Modifiers::FN, "FN"),
-            (Modifiers::CAPS_LOCK, "CAPS_LOCK"),
         ];
         if self.is_empty() {
             return write!(f, "Modifiers(NONE)");
@@ -485,7 +482,6 @@ pub(crate) const MODIFIER_TOKENS: &[(Modifiers, &str)] = &[
     (Modifiers::ALT, "Alt"),
     (Modifiers::SHIFT, "Shift"),
     (Modifiers::SUPER, "Super"),
-    (Modifiers::CAPS_LOCK, "CapsLock"),
 ];
 
 /// Parses one modifier token: a name from [`MODIFIER_TOKENS`] or raw bits as
@@ -668,7 +664,6 @@ mod tests {
             Ok(Modifiers::SUPER | Modifiers::SHIFT)
         );
         assert_eq!("0x3".parse(), Ok(Modifiers::SHIFT | Modifiers::CONTROL));
-        assert_eq!("CapsLock".parse(), Ok(Modifiers::CAPS_LOCK));
     }
 
     #[test]

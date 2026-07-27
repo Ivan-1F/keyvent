@@ -470,10 +470,8 @@ mod tests {
     #[test]
     fn caps_lock_records_as_trigger() {
         let mut s = recording();
-        // The OS reports the CAPS_LOCK toggle bit in the snapshot; it is not
-        // a held modifier and must not leak into the hotkey.
-        s.handle(&press(Key::CapsLock, Modifiers::CAPS_LOCK));
-        let (events, _) = s.handle(&release(Key::CapsLock, Modifiers::CAPS_LOCK));
+        s.handle(&press(Key::CapsLock, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::CapsLock, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
