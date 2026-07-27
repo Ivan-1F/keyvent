@@ -24,6 +24,11 @@ pub fn encode(vk: u32, scan: u32, extended: bool) -> Keycode {
     }
 }
 
+/// Every code [`encode`] can produce, for install-time state seeding.
+pub(crate) fn all_codes() -> impl Iterator<Item = Keycode> {
+    (1u16..=0xFF).chain(0xE001..=0xE0FF).chain(0xF001..=0xF0FF)
+}
+
 pub fn key_from_code(code: Keycode) -> Key {
     match code {
         0x01 => Key::Escape,
