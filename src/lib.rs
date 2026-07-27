@@ -33,7 +33,9 @@ mod tap;
 use std::sync::{Arc, Mutex, Weak, mpsc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
-pub use hotkey::{Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, Suppression};
+pub use hotkey::{
+    Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, HotkeyRecorder, RecorderEvent, Suppression,
+};
 
 use crate::dispatcher::{Dispatcher, DispatcherCommand};
 use supervisor::StatusBroadcast;

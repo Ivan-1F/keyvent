@@ -24,8 +24,10 @@
 
 mod engine;
 mod manager;
+mod recorder;
 
 pub use manager::HotkeyManager;
+pub use recorder::{HotkeyRecorder, RecorderEvent};
 
 use std::time::Duration;
 
