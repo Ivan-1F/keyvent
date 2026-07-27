@@ -87,6 +87,7 @@ impl Suppression {
     /// Drop entries whose key is no longer physically held; returns their
     /// keycodes so the tap layer can keep the books clean across rebuilds.
     /// `is_held` reports physical state (CGEventSourceKeyState).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn reconcile(&mut self, is_held: impl Fn(Keycode) -> bool) -> Vec<Keycode> {
         let released: Vec<Keycode> = self
             .swallowed_presses

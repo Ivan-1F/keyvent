@@ -1,5 +1,11 @@
-//! Windows backend: a low-level keyboard hook (`WH_KEYBOARD_LL`) on a
-//! message-pump thread.
+//! Windows backend: one low-level keyboard hook thread, no supervisor.
 
-pub(crate) mod convert;
-pub(crate) mod keycode;
+#[cfg(any(target_os = "windows", test))]
+mod convert;
+#[cfg(target_os = "windows")]
+mod hook;
+#[cfg(any(target_os = "windows", test))]
+mod keycode;
+
+#[cfg(target_os = "windows")]
+pub(crate) use hook::HookThread;

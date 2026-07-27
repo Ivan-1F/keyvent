@@ -31,8 +31,8 @@ mod platform;
 mod status;
 mod suppress;
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("keyvent currently supports macOS only");
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+compile_error!("keyvent currently supports macOS and Windows only");
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 
@@ -42,8 +42,11 @@ pub use hotkey::{
     Suppression,
 };
 
-use crate::dispatcher::{Dispatcher, DispatcherCommand};
+use crate::dispatcher::{BoxedCallback, Dispatcher, DispatcherCommand};
+#[cfg(target_os = "macos")]
 use crate::platform::macos::{Supervisor, TapShared, TapThread};
+#[cfg(target_os = "windows")]
+use crate::platform::windows::HookThread;
 use status::StatusBroadcast;
 
 /// Lifecycle status of the event stream.
@@ -73,27 +76,36 @@ impl Status {
 /// exactly as long as at least one guard is.
 static ENGINE: Mutex<Option<Weak<Engine>>> = Mutex::new(None);
 
-/// The process-wide engine: one tap thread + one supervisor, shared by all
-/// guards. Created by the first `start`; dropped — and shut down — when the
-/// last guard drops.
+/// The process-wide engine: one platform event source, shared by all guards.
+/// Created by the first `start`; dropped — and shut down — when the last
+/// guard drops.
 struct Engine {
+    #[cfg(target_os = "macos")]
     supervisor: Option<Supervisor>,
+    #[cfg(target_os = "windows")]
+    hook: Option<HookThread>,
     commands: mpsc::Sender<DispatcherCommand>,
     broadcast: Arc<StatusBroadcast>,
 }
 
 impl Engine {
     fn spawn() -> Arc<Self> {
-        let shared = Arc::new(TapShared::new());
         let (commands, mut dispatcher) = Dispatcher::new();
-        let tap = TapThread::spawn(
-            Box::new(move |event| dispatcher.handle(event)),
-            shared.clone(),
-        );
+        let callback: BoxedCallback = Box::new(move |event| dispatcher.handle(event));
         let broadcast = Arc::new(StatusBroadcast::new(Status::Silent));
-        let supervisor = Supervisor::spawn(tap, shared, broadcast.clone());
+        #[cfg(target_os = "macos")]
+        let supervisor = {
+            let shared = Arc::new(TapShared::new());
+            let tap = TapThread::spawn(callback, shared.clone());
+            Supervisor::spawn(tap, shared, broadcast.clone())
+        };
+        #[cfg(target_os = "windows")]
+        let hook = HookThread::spawn(callback, broadcast.clone());
         Arc::new(Self {
+            #[cfg(target_os = "macos")]
             supervisor: Some(supervisor),
+            #[cfg(target_os = "windows")]
+            hook: Some(hook),
             commands,
             broadcast,
         })
@@ -121,10 +133,15 @@ impl Drop for Engine {
     fn drop(&mut self) {
         // Runs on the thread dropping the last guard, never under the global
         // lock. Joining the threads can take seconds in the worst case; the
-        // tap is force-invalidated first thing in shutdown, so a concurrently
+        // event source is torn down first thing in shutdown, so a concurrently
         // re-spawned engine never meaningfully overlaps with this one.
+        #[cfg(target_os = "macos")]
         if let Some(supervisor) = self.supervisor.take() {
             supervisor.shutdown();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(hook) = self.hook.take() {
+            hook.shutdown();
         }
     }
 }

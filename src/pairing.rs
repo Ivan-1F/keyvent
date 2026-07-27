@@ -70,6 +70,7 @@ impl Pairing {
 
     /// Close dangling presses whose key is physically up; returns their
     /// keycodes for synthetic releases. Keys still held stay open.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn reconcile(&mut self, is_held: impl Fn(Keycode) -> bool) -> Vec<Keycode> {
         let released: Vec<Keycode> = self
             .pressed

@@ -61,7 +61,8 @@ impl Tracker {
         }
     }
 
-    fn snapshot(&self) -> Modifiers {
+    /// The current modifier snapshot: the groups of the held modifier keys.
+    pub(crate) fn snapshot(&self) -> Modifiers {
         let mut snapshot = Modifiers::NONE;
         for &key in &self.pressed {
             if let Some(group) = key.modifier_group() {
