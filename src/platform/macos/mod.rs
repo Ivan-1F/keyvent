@@ -370,10 +370,10 @@ fn modifiers_from_cg(flags: CGEventFlags) -> Modifiers {
         bits |= Modifiers::CONTROL.bits();
     }
     if flags.contains(CGEventFlags::MaskAlternate) {
-        bits |= Modifiers::OPTION.bits();
+        bits |= Modifiers::ALT.bits();
     }
     if flags.contains(CGEventFlags::MaskCommand) {
-        bits |= Modifiers::COMMAND.bits();
+        bits |= Modifiers::SUPER.bits();
     }
     if flags.contains(CGEventFlags::MaskSecondaryFn) {
         bits |= Modifiers::FN.bits();

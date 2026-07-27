@@ -9,9 +9,9 @@
 //! - The recording commits when every key is released. Modifier snapshots
 //!   are taken at the trigger key's press; with no trigger key the gesture
 //!   is modifier-only: a lone modifier key records side-specifically
-//!   (`{NONE, OptionRight}`), several record the peak modifier set
-//!   (`{CMD|SHIFT, None}`) — pressing both sides of a modifier is how the
-//!   side-agnostic group (`{OPT, None}`) is recorded.
+//!   (`{NONE, AltRight}`), several record the peak modifier set
+//!   (`{SUPER|SHIFT, None}`) — pressing both sides of a modifier is how the
+//!   side-agnostic group (`{ALT, None}`) is recorded.
 //! - Bare Esc cancels and bare Delete clears; with modifiers held, both are
 //!   ordinary recordable keys.
 //! - All keyboard input is swallowed while recording.
@@ -285,31 +285,31 @@ mod tests {
     fn cmd_k_commits_on_last_release() {
         let mut s = recording();
         // A lone modifier previews as the exact key...
-        let (events, _) = s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
+        let (events, _) = s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
                 Modifiers::NONE,
-                Some(Key::CommandLeft)
+                Some(Key::SuperLeft)
             ))]
         );
         // ...and a struck key turns it into a plain modifier+trigger.
-        let (events, _) = s.handle(&press(Key::KeyK, Modifiers::COMMAND));
+        let (events, _) = s.handle(&press(Key::KeyK, Modifiers::SUPER));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyK)
             ))]
         );
-        // Trigger released but Cmd still held: no commit.
-        let (events, _) = s.handle(&release(Key::KeyK, Modifiers::COMMAND));
+        // Trigger released but Super still held: no commit.
+        let (events, _) = s.handle(&release(Key::KeyK, Modifiers::SUPER));
         assert!(events.is_empty());
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyK)
             ))]
         );
@@ -318,26 +318,26 @@ mod tests {
     #[test]
     fn last_trigger_wins_and_sticks() {
         let mut s = recording();
-        s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
-        s.handle(&press(Key::KeyK, Modifiers::COMMAND));
-        // Still holding Cmd, strike J instead: candidate becomes Cmd+J.
-        let (events, _) = s.handle(&press(Key::KeyJ, Modifiers::COMMAND));
+        s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
+        s.handle(&press(Key::KeyK, Modifiers::SUPER));
+        // Still holding Super, strike J instead: candidate becomes Super+J.
+        let (events, _) = s.handle(&press(Key::KeyJ, Modifiers::SUPER));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyJ)
             ))]
         );
         // Releasing a trigger does not degrade the candidate.
-        let (events, _) = s.handle(&release(Key::KeyJ, Modifiers::COMMAND));
+        let (events, _) = s.handle(&release(Key::KeyJ, Modifiers::SUPER));
         assert!(events.is_empty());
-        s.handle(&release(Key::KeyK, Modifiers::COMMAND));
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        s.handle(&release(Key::KeyK, Modifiers::SUPER));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyJ)
             ))]
         );
@@ -346,11 +346,11 @@ mod tests {
     #[test]
     fn trigger_modifiers_frozen_at_its_press() {
         let mut s = recording();
-        // K struck before Cmd: bare K, even though Cmd is held at the end.
+        // K struck before Super: bare K, even though Super is held at the end.
         s.handle(&press(Key::KeyK, Modifiers::NONE));
-        s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
-        s.handle(&release(Key::KeyK, Modifiers::COMMAND));
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
+        s.handle(&release(Key::KeyK, Modifiers::SUPER));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
@@ -363,26 +363,23 @@ mod tests {
     #[test]
     fn modifier_only_records_peak_set() {
         let mut s = recording();
-        s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
-        let (events, _) = s.handle(&press(
-            Key::ShiftLeft,
-            Modifiers::COMMAND | Modifiers::SHIFT,
-        ));
+        s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
+        let (events, _) = s.handle(&press(Key::ShiftLeft, Modifiers::SUPER | Modifiers::SHIFT));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
-                Modifiers::COMMAND | Modifiers::SHIFT,
+                Modifiers::SUPER | Modifiers::SHIFT,
                 None
             ))]
         );
         // Shift released early: the peak still includes it.
-        let (events, _) = s.handle(&release(Key::ShiftLeft, Modifiers::COMMAND));
+        let (events, _) = s.handle(&release(Key::ShiftLeft, Modifiers::SUPER));
         assert!(events.is_empty());
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND | Modifiers::SHIFT,
+                Modifiers::SUPER | Modifiers::SHIFT,
                 None
             ))]
         );
@@ -392,20 +389,20 @@ mod tests {
     fn lone_modifier_records_the_exact_key() {
         let mut s = recording();
         // The live preview already shows the exact key, not the group.
-        let (events, _) = s.handle(&press(Key::OptionRight, Modifiers::OPTION));
+        let (events, _) = s.handle(&press(Key::AltRight, Modifiers::ALT));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
                 Modifiers::NONE,
-                Some(Key::OptionRight)
+                Some(Key::AltRight)
             ))]
         );
-        let (events, _) = s.handle(&release(Key::OptionRight, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::AltRight, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
                 Modifiers::NONE,
-                Some(Key::OptionRight)
+                Some(Key::AltRight)
             ))]
         );
     }
@@ -413,43 +410,34 @@ mod tests {
     #[test]
     fn both_option_sides_record_the_group() {
         let mut s = recording();
-        s.handle(&press(Key::OptionLeft, Modifiers::OPTION));
+        s.handle(&press(Key::AltLeft, Modifiers::ALT));
         // Second side joins: the candidate flips to the side-agnostic group.
-        let (events, _) = s.handle(&press(Key::OptionRight, Modifiers::OPTION));
+        let (events, _) = s.handle(&press(Key::AltRight, Modifiers::ALT));
         assert_eq!(
             events,
-            vec![RecorderEvent::Candidate(Hotkey::new(
-                Modifiers::OPTION,
-                None
-            ))]
+            vec![RecorderEvent::Candidate(Hotkey::new(Modifiers::ALT, None))]
         );
-        let (events, _) = s.handle(&release(Key::OptionLeft, Modifiers::OPTION));
+        let (events, _) = s.handle(&release(Key::AltLeft, Modifiers::ALT));
         assert!(events.is_empty());
-        let (events, _) = s.handle(&release(Key::OptionRight, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::AltRight, Modifiers::NONE));
         assert_eq!(
             events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::OPTION,
-                None
-            ))]
+            vec![RecorderEvent::Recorded(Hotkey::new(Modifiers::ALT, None))]
         );
     }
 
     #[test]
     fn mid_hold_modifier_start_falls_back_to_peak() {
-        // Recording started with Cmd already held; its press was never seen,
+        // Recording started with Super already held; its press was never seen,
         // so the lone-key rule cannot apply and the peak set is the record.
         let mut s = recording();
-        s.handle(&press(
-            Key::ShiftLeft,
-            Modifiers::COMMAND | Modifiers::SHIFT,
-        ));
-        s.handle(&release(Key::ShiftLeft, Modifiers::COMMAND));
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        s.handle(&press(Key::ShiftLeft, Modifiers::SUPER | Modifiers::SHIFT));
+        s.handle(&release(Key::ShiftLeft, Modifiers::SUPER));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND | Modifiers::SHIFT,
+                Modifiers::SUPER | Modifiers::SHIFT,
                 None
             ))]
         );
@@ -535,17 +523,17 @@ mod tests {
     #[test]
     fn repeats_are_ignored() {
         let mut s = recording();
-        s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
-        s.handle(&press(Key::KeyK, Modifiers::COMMAND));
+        s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
+        s.handle(&press(Key::KeyK, Modifiers::SUPER));
         // Holding K repeats it: no new candidate, still swallowed.
-        let (events, swallow) = s.handle(&repeat(Key::KeyK, Modifiers::COMMAND));
+        let (events, swallow) = s.handle(&repeat(Key::KeyK, Modifiers::SUPER));
         assert!(events.is_empty() && swallow);
-        s.handle(&release(Key::KeyK, Modifiers::COMMAND));
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        s.handle(&release(Key::KeyK, Modifiers::SUPER));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyK)
             ))]
         );
@@ -558,31 +546,31 @@ mod tests {
         // never seen.
         let (events, swallow) = s.handle(&release(Key::KeyK, Modifiers::NONE));
         assert!(events.is_empty() && swallow);
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert!(events.is_empty());
     }
 
     #[test]
     fn mid_hold_start_uses_snapshots() {
         let mut s = recording();
-        // Recording started with Cmd already held; its press was never seen.
-        let (events, _) = s.handle(&press(Key::KeyK, Modifiers::COMMAND));
+        // Recording started with Super already held; its press was never seen.
+        let (events, _) = s.handle(&press(Key::KeyK, Modifiers::SUPER));
         assert_eq!(
             events,
             vec![RecorderEvent::Candidate(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyK)
             ))]
         );
-        // K released while Cmd still held (per the snapshot): no commit.
-        let (events, _) = s.handle(&release(Key::KeyK, Modifiers::COMMAND));
+        // K released while Super still held (per the snapshot): no commit.
+        let (events, _) = s.handle(&release(Key::KeyK, Modifiers::SUPER));
         assert!(events.is_empty());
-        // Cmd released: commit, with the modifiers from K's press snapshot.
-        let (events, _) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        // Super released: commit, with the modifiers from K's press snapshot.
+        let (events, _) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             events,
             vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::COMMAND,
+                Modifiers::SUPER,
                 Some(Key::KeyK)
             ))]
         );
@@ -610,9 +598,9 @@ mod tests {
     #[test]
     fn cancel_stops_recording() {
         let mut s = recording();
-        s.handle(&press(Key::CommandLeft, Modifiers::COMMAND));
+        s.handle(&press(Key::SuperLeft, Modifiers::SUPER));
         s.cancel();
-        let (events, swallow) = s.handle(&release(Key::CommandLeft, Modifiers::NONE));
+        let (events, swallow) = s.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert!(events.is_empty() && !swallow);
     }
 }

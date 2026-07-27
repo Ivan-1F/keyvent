@@ -8,15 +8,15 @@
 //!
 //! Covered shapes:
 //!
-//! | intent                     | form                              |
-//! |----------------------------|-----------------------------------|
-//! | `Cmd+K`                    | `{CMD, Some(K)}`                   |
-//! | bare `F5`                  | `{NONE, Some(F5)}`                 |
-//! | single `Option` (either)   | `{OPT, None}`                      |
-//! | only right `Option`        | `{NONE, Some(OptionRight)}`        |
-//! | single `Fn`                | `{FN, None}`                       |
-//! | `Fn+K`                     | `{FN, Some(K)}`                    |
-//! | `Cmd+Shift` (no key)       | `{CMD\|SHIFT, None}`               |
+//! | intent                    | form                              |
+//! |---------------------------|-----------------------------------|
+//! | `Super+K`                 | `{SUPER, Some(K)}`                |
+//! | bare `F5`                 | `{NONE, Some(F5)}`                |
+//! | single `Alt` (either)     | `{ALT, None}`                     |
+//! | only right `Alt`          | `{NONE, Some(AltRight)}`          |
+//! | single `Fn`               | `{FN, None}`                      |
+//! | `Fn+K`                    | `{FN, Some(K)}`                   |
+//! | `Super+Shift` (no key)    | `{SUPER\|SHIFT, None}`            |
 //!
 //! Registering an Fn-alone hotkey (`{FN, None}`) with [`Suppression::Swallow`]
 //! also suppresses the system "Press 🌐 key to" action (emoji panel, input
@@ -36,7 +36,7 @@ use crate::{Key, Modifiers};
 /// A global hotkey: `modifiers` must be exactly held, and
 /// - `Some(trigger)`: the hotkey goes down when `trigger` is pressed and up
 ///   when it is released. The trigger may itself be a side-specific modifier
-///   key (e.g. `Key::OptionRight`), which is how side-specific hotkeys are
+///   key (e.g. `Key::AltRight`), which is how side-specific hotkeys are
 ///   expressed;
 /// - `None` (modifier-only): the hotkey goes down the moment the modifier set
 ///   becomes complete, and up the moment any member leaves the set.
@@ -63,8 +63,8 @@ impl Hotkey {
             Some(k) => {
                 // A modifier trigger already satisfies its own group, so a
                 // matching bit in `modifiers` is redundant and stripped:
-                // `{OPT, OptionRight}` means the same as `{NONE, OptionRight}`.
-                // (Expressing "hold left Option, press right Option" is not
+                // `{ALT, AltRight}` means the same as `{NONE, AltRight}`.
+                // (Expressing "hold left Alt, press right Alt" is not
                 // currently possible.)
                 let modifiers = match modifier_bit_of(k) {
                     Some(bit) => modifiers - bit,
@@ -93,7 +93,7 @@ impl Hotkey {
     }
 
     /// True if a press carrying `snapshot` satisfies the modifier requirement.
-    /// A modifier trigger (e.g. `OptionRight`) contributes its own group bit
+    /// A modifier trigger (e.g. `AltRight`) contributes its own group bit
     /// to the snapshot by definition, so the REST is matched exactly — the
     /// constructor has already stripped that bit from `modifiers`.
     fn modifiers_match(&self, snapshot: Modifiers) -> bool {
@@ -149,8 +149,8 @@ impl HotkeyEvent {
 /// state, not a held modifier, and must not affect hotkey matching.
 const MATCH_BITS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::CONTROL)
-    .union(Modifiers::OPTION)
-    .union(Modifiers::COMMAND)
+    .union(Modifiers::ALT)
+    .union(Modifiers::SUPER)
     .union(Modifiers::FN);
 
 /// Exact match: the event's modifiers (restricted to match bits) equal the
@@ -171,26 +171,26 @@ mod tests {
             Hotkey::new(Modifiers::FN, None)
         );
         // Side-specific modifiers in the trigger slot keep their side.
-        let right = Hotkey::new(Modifiers::NONE, Some(Key::OptionRight));
-        assert_eq!(right.key(), Some(Key::OptionRight));
+        let right = Hotkey::new(Modifiers::NONE, Some(Key::AltRight));
+        assert_eq!(right.key(), Some(Key::AltRight));
         assert_eq!(right.modifiers(), Modifiers::NONE);
-        assert_ne!(right, Hotkey::new(Modifiers::OPTION, None));
-        let left = Hotkey::new(Modifiers::NONE, Some(Key::OptionLeft));
+        assert_ne!(right, Hotkey::new(Modifiers::ALT, None));
+        let left = Hotkey::new(Modifiers::NONE, Some(Key::AltLeft));
         assert_ne!(left, right);
     }
 
     #[test]
     fn trigger_group_bit_is_stripped_from_modifiers() {
-        // The trigger already satisfies its own group: `{OPT, OptionRight}`
-        // normalizes to `{NONE, OptionRight}` instead of being unsatisfiable.
+        // The trigger already satisfies its own group: `{ALT, AltRight}`
+        // normalizes to `{NONE, AltRight}` instead of being unsatisfiable.
         assert_eq!(
-            Hotkey::new(Modifiers::OPTION, Some(Key::OptionRight)),
-            Hotkey::new(Modifiers::NONE, Some(Key::OptionRight))
+            Hotkey::new(Modifiers::ALT, Some(Key::AltRight)),
+            Hotkey::new(Modifiers::NONE, Some(Key::AltRight))
         );
         // Unrelated modifier bits are kept.
-        let h = Hotkey::new(Modifiers::SHIFT | Modifiers::OPTION, Some(Key::OptionRight));
+        let h = Hotkey::new(Modifiers::SHIFT | Modifiers::ALT, Some(Key::AltRight));
         assert_eq!(h.modifiers(), Modifiers::SHIFT);
-        assert_eq!(h.key(), Some(Key::OptionRight));
+        assert_eq!(h.key(), Some(Key::AltRight));
     }
 
     #[test]
@@ -202,15 +202,15 @@ mod tests {
 
     #[test]
     fn exact_matching_ignores_caps_lock() {
-        let h = Hotkey::new(Modifiers::COMMAND, Some(Key::KeyK));
+        let h = Hotkey::new(Modifiers::SUPER, Some(Key::KeyK));
         assert!(modifiers_exact(
-            Modifiers::COMMAND | Modifiers::CAPS_LOCK,
+            Modifiers::SUPER | Modifiers::CAPS_LOCK,
             h.modifiers()
         ));
         assert!(!modifiers_exact(
-            Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers::SUPER | Modifiers::SHIFT,
             h.modifiers()
         ));
-        assert!(modifiers_exact(Modifiers::COMMAND, h.modifiers()));
+        assert!(modifiers_exact(Modifiers::SUPER, h.modifiers()));
     }
 }

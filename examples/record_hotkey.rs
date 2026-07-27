@@ -68,9 +68,9 @@ fn show(hotkey: Hotkey) -> String {
     let mods = hotkey.modifiers();
     for (bit, symbol) in [
         (Modifiers::CONTROL, "⌃"),
-        (Modifiers::OPTION, "⌥"),
+        (Modifiers::ALT, "⌥"),
         (Modifiers::SHIFT, "⇧"),
-        (Modifiers::COMMAND, "⌘"),
+        (Modifiers::SUPER, "⌘"),
         (Modifiers::FN, "🌐"),
     ] {
         if mods.contains(bit) {
@@ -84,7 +84,7 @@ fn show(hotkey: Hotkey) -> String {
 }
 
 fn key_name(key: Key) -> String {
-    // Debug gives "KeyK", "F5", "OptionRight"; strip the letter-key prefix.
+    // Debug gives "KeyK", "F5", "AltRight"; strip the letter-key prefix.
     let debug = format!("{key:?}");
     debug
         .strip_prefix("Key")

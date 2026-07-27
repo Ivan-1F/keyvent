@@ -26,10 +26,10 @@ impl SideState {
     const SHIFT_R: Self = Self(1 << 1);
     const CONTROL_L: Self = Self(1 << 2);
     const CONTROL_R: Self = Self(1 << 3);
-    const OPTION_L: Self = Self(1 << 4);
-    const OPTION_R: Self = Self(1 << 5);
-    const COMMAND_L: Self = Self(1 << 6);
-    const COMMAND_R: Self = Self(1 << 7);
+    const ALT_L: Self = Self(1 << 4);
+    const ALT_R: Self = Self(1 << 5);
+    const SUPER_L: Self = Self(1 << 6);
+    const SUPER_R: Self = Self(1 << 7);
 
     const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
@@ -50,10 +50,10 @@ fn side_of(key: Key) -> Option<(SideState, Modifiers)> {
         Key::ShiftRight => SideState::SHIFT_R,
         Key::ControlLeft => SideState::CONTROL_L,
         Key::ControlRight => SideState::CONTROL_R,
-        Key::OptionLeft => SideState::OPTION_L,
-        Key::OptionRight => SideState::OPTION_R,
-        Key::CommandLeft => SideState::COMMAND_L,
-        Key::CommandRight => SideState::COMMAND_R,
+        Key::AltLeft => SideState::ALT_L,
+        Key::AltRight => SideState::ALT_R,
+        Key::SuperLeft => SideState::SUPER_L,
+        Key::SuperRight => SideState::SUPER_R,
         _ => return None,
     };
     Some((side, group))
@@ -123,10 +123,10 @@ impl ModifierTracker {
             (Key::ShiftRight, SideState::SHIFT_R),
             (Key::ControlLeft, SideState::CONTROL_L),
             (Key::ControlRight, SideState::CONTROL_R),
-            (Key::OptionLeft, SideState::OPTION_L),
-            (Key::OptionRight, SideState::OPTION_R),
-            (Key::CommandLeft, SideState::COMMAND_L),
-            (Key::CommandRight, SideState::COMMAND_R),
+            (Key::AltLeft, SideState::ALT_L),
+            (Key::AltRight, SideState::ALT_R),
+            (Key::SuperLeft, SideState::SUPER_L),
+            (Key::SuperRight, SideState::SUPER_R),
         ];
         for (key, side) in SIDE_KEYS {
             if let Some(code) = keycode::code_from_key(key)
@@ -148,12 +148,8 @@ impl ModifierTracker {
                 SideState::CONTROL_L,
                 SideState::CONTROL_R,
             ),
-            (Modifiers::OPTION, SideState::OPTION_L, SideState::OPTION_R),
-            (
-                Modifiers::COMMAND,
-                SideState::COMMAND_L,
-                SideState::COMMAND_R,
-            ),
+            (Modifiers::ALT, SideState::ALT_L, SideState::ALT_R),
+            (Modifiers::SUPER, SideState::SUPER_L, SideState::SUPER_R),
         ];
         for (group, left, right) in GROUPS {
             if skip == Some(group) {
@@ -295,32 +291,32 @@ mod tests {
     #[test]
     fn reconcile_assumes_left_for_missed_press() {
         let mut t = ModifierTracker::default();
-        // First event ever seen already has COMMAND held: press was missed.
-        let e = convert(0, false, Modifiers::COMMAND, &mut t, RawKind::Down);
-        assert_eq!(e.modifiers, Modifiers::COMMAND);
-        // CommandRight release arrives with the aggregate CLEAR: the aggregate
+        // First event ever seen already has SUPER held: press was missed.
+        let e = convert(0, false, Modifiers::SUPER, &mut t, RawKind::Down);
+        assert_eq!(e.modifiers, Modifiers::SUPER);
+        // SuperRight release arrives with the aggregate CLEAR: the aggregate
         // rule determines this is a release (never a toggle-mislabeled press),
-        // and the same event's reconcile clears the phantom CommandLeft that
+        // and the same event's reconcile clears the phantom SuperLeft that
         // assume-left had inserted. Tracker must not go negative or leak state.
         let e = convert(54, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
-        assert_eq!(e.key, Key::CommandRight);
+        assert_eq!(e.key, Key::SuperRight);
         assert_eq!(e.kind, KeyEventKind::Release);
-        // Phantom state is gone: a subsequent CommandLeft FlagsChanged with the
+        // Phantom state is gone: a subsequent SuperLeft FlagsChanged with the
         // aggregate set is inferred as a fresh press.
-        let e = convert(55, false, Modifiers::COMMAND, &mut t, RawKind::FlagsChanged);
+        let e = convert(55, false, Modifiers::SUPER, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
     }
 
     #[test]
     fn aggregate_clear_release_rule_heals_missed_press() {
         let mut t = ModifierTracker::default();
-        // Tap installed while CommandLeft was held; its press is in the blind
+        // Tap installed while SuperLeft was held; its press is in the blind
         // zone. No assume-left has fired yet (no plain event seen).
         // The user releases it: aggregate clears -> deterministic Release.
         let e = convert(55, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(
             e,
-            ev(Key::CommandLeft, KeyEventKind::Release, Modifiers::NONE)
+            ev(Key::SuperLeft, KeyEventKind::Release, Modifiers::NONE)
         );
     }
 

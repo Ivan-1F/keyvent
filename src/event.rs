@@ -13,11 +13,13 @@
 use std::fmt;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, Sub, SubAssign};
 
-/// A physical key on a macOS keyboard.
+/// A physical key on the keyboard.
 ///
 /// Modifier keys are side-specific (`ShiftLeft` vs `ShiftRight`). `Function`
 /// is the Fn/Globe key (keycode 0x3F); on macOS it only generates flags-changed
 /// events, which the tap layer normalizes into regular press/release events.
+/// `Function` is not reported on Windows, where Fn is handled inside keyboard
+/// firmware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Key {
@@ -25,12 +27,12 @@ pub enum Key {
     ShiftRight,
     ControlLeft,
     ControlRight,
-    /// The Option key (labeled ⌥; "Alt" on non-Apple keyboards).
-    OptionLeft,
-    OptionRight,
-    /// The Command key (⌘).
-    CommandLeft,
-    CommandRight,
+    /// The Alt key (⌥ Option on macOS).
+    AltLeft,
+    AltRight,
+    /// The Super key (⌘ Command on macOS, ⊞ Win on Windows).
+    SuperLeft,
+    SuperRight,
     CapsLock,
     /// The Fn/Globe key (🌐).
     Function,
@@ -130,8 +132,8 @@ impl Key {
         Some(match self {
             Key::ShiftLeft | Key::ShiftRight => Modifiers::SHIFT,
             Key::ControlLeft | Key::ControlRight => Modifiers::CONTROL,
-            Key::OptionLeft | Key::OptionRight => Modifiers::OPTION,
-            Key::CommandLeft | Key::CommandRight => Modifiers::COMMAND,
+            Key::AltLeft | Key::AltRight => Modifiers::ALT,
+            Key::SuperLeft | Key::SuperRight => Modifiers::SUPER,
             _ => return None,
         })
     }
@@ -169,9 +171,9 @@ impl Modifiers {
     pub const NONE: Self = Self(0);
     pub const SHIFT: Self = Self(1 << 0);
     pub const CONTROL: Self = Self(1 << 1);
-    pub const OPTION: Self = Self(1 << 2);
-    pub const COMMAND: Self = Self(1 << 3);
-    /// The Fn/Globe key.
+    pub const ALT: Self = Self(1 << 2);
+    pub const SUPER: Self = Self(1 << 3);
+    /// The Fn/Globe key (macOS only).
     pub const FN: Self = Self(1 << 4);
     pub const CAPS_LOCK: Self = Self(1 << 5);
 
@@ -258,8 +260,8 @@ impl fmt::Debug for Modifiers {
         const NAMES: [(Modifiers, &str); 6] = [
             (Modifiers::SHIFT, "SHIFT"),
             (Modifiers::CONTROL, "CONTROL"),
-            (Modifiers::OPTION, "OPTION"),
-            (Modifiers::COMMAND, "COMMAND"),
+            (Modifiers::ALT, "ALT"),
+            (Modifiers::SUPER, "SUPER"),
             (Modifiers::FN, "FN"),
             (Modifiers::CAPS_LOCK, "CAPS_LOCK"),
         ];
@@ -287,22 +289,22 @@ mod tests {
 
     #[test]
     fn modifiers_bitops() {
-        let m = Modifiers::SHIFT | Modifiers::COMMAND;
+        let m = Modifiers::SHIFT | Modifiers::SUPER;
         assert!(m.contains(Modifiers::SHIFT));
-        assert!(m.contains(Modifiers::COMMAND));
-        assert!(!m.contains(Modifiers::OPTION));
-        assert!(m.intersects(Modifiers::COMMAND | Modifiers::OPTION));
-        assert!(!m.intersects(Modifiers::OPTION));
-        assert_eq!(m - Modifiers::SHIFT, Modifiers::COMMAND);
-        assert!((m - Modifiers::SHIFT - Modifiers::COMMAND).is_empty());
+        assert!(m.contains(Modifiers::SUPER));
+        assert!(!m.contains(Modifiers::ALT));
+        assert!(m.intersects(Modifiers::SUPER | Modifiers::ALT));
+        assert!(!m.intersects(Modifiers::ALT));
+        assert_eq!(m - Modifiers::SHIFT, Modifiers::SUPER);
+        assert!((m - Modifiers::SHIFT - Modifiers::SUPER).is_empty());
     }
 
     #[test]
     fn modifiers_debug() {
         assert_eq!(format!("{:?}", Modifiers::NONE), "Modifiers(NONE)");
         assert_eq!(
-            format!("{:?}", Modifiers::COMMAND | Modifiers::FN),
-            "Modifiers(COMMAND|FN)"
+            format!("{:?}", Modifiers::SUPER | Modifiers::FN),
+            "Modifiers(SUPER|FN)"
         );
     }
 }

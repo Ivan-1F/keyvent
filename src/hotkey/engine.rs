@@ -165,12 +165,12 @@ mod tests {
         m
     }
 
-    /// A matcher with one Cmd+K hotkey registered as id 0.
-    fn cmd_k(suppression: Suppression) -> (HotkeyId, Matcher) {
+    /// A matcher with one Super+K hotkey registered as id 0.
+    fn super_k(suppression: Suppression) -> (HotkeyId, Matcher) {
         let id = HotkeyId(0);
         let m = matcher_with(
             id,
-            Hotkey::new(Modifiers::COMMAND, Some(Key::KeyK)),
+            Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)),
             suppression,
         );
         (id, m)
@@ -178,23 +178,19 @@ mod tests {
 
     #[test]
     fn trigger_hotkey_down_up() {
-        let (id, mut m) = cmd_k(Suppression::Pass);
-        // K without Cmd: nothing.
+        let (id, mut m) = super_k(Suppression::Pass);
+        // K without Super: nothing.
         let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::NONE));
         assert!(events.is_empty() && !swallow);
-        // Cmd+K: Down.
-        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        // Super+K: Down.
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(!swallow);
         // Repeat while held: no new event.
-        let (events, _) = m.handle(&repeat(Key::KeyK, Modifiers::COMMAND));
+        let (events, _) = m.handle(&repeat(Key::KeyK, Modifiers::SUPER));
         assert!(events.is_empty());
-        // Modifier drifts mid-hold (Cmd released first): still active, no Up.
-        let (events, _) = m.handle(&ev(
-            Key::CommandLeft,
-            KeyEventKind::Release,
-            Modifiers::NONE,
-        ));
+        // Modifier drifts mid-hold (Super released first): still active, no Up.
+        let (events, _) = m.handle(&ev(Key::SuperLeft, KeyEventKind::Release, Modifiers::NONE));
         assert!(events.is_empty());
         // K released: Up.
         let (events, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
@@ -203,27 +199,27 @@ mod tests {
 
     #[test]
     fn exact_match_rejects_extra_modifiers() {
-        let (_id, mut m) = cmd_k(Suppression::Pass);
+        let (_id, mut m) = super_k(Suppression::Pass);
         let (events, _) = m.handle(&ev(
             Key::KeyK,
             KeyEventKind::Press,
-            Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers::SUPER | Modifiers::SHIFT,
         ));
         assert!(events.is_empty());
     }
 
     #[test]
     fn swallow_flag_only_for_swallow_registration() {
-        let (id, mut m) = cmd_k(Suppression::Swallow);
-        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (id, mut m) = super_k(Suppression::Swallow);
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
     }
 
     #[test]
     fn unregister_mid_hold_drops_activation() {
-        let (id, mut m) = cmd_k(Suppression::Pass);
-        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (id, mut m) = super_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         m.unregister(id);
         // Release after unregister: no Up.
         let (events, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
@@ -231,23 +227,18 @@ mod tests {
     }
 
     #[test]
-    fn modifier_only_single_option() {
+    fn modifier_only_single_alt() {
         let id = HotkeyId(1);
-        let mut m = matcher_with(
-            id,
-            Hotkey::new(Modifiers::OPTION, None),
-            Suppression::Swallow,
-        );
-        // Option down (snapshot OPTION): Down + swallow.
-        let (events, swallow) =
-            m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
+        let mut m = matcher_with(id, Hotkey::new(Modifiers::ALT, None), Suppression::Swallow);
+        // Alt down (snapshot ALT): Down + swallow.
+        let (events, swallow) = m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
         // Typing while held: no transition, no swallow (unrelated key).
-        let (events, swallow) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, swallow) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::ALT));
         assert!(events.is_empty() && !swallow);
-        // Option up: Up.
-        let (events, _) = m.handle(&ev(Key::OptionLeft, KeyEventKind::Release, Modifiers::NONE));
+        // Alt up: Up.
+        let (events, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
         assert!(matches!(events.as_slice(), [HotkeyEvent::Up { id: i, .. }] if *i == id));
     }
 
@@ -270,10 +261,10 @@ mod tests {
 
     #[test]
     fn held_for_is_reported() {
-        let (id, mut m) = cmd_k(Suppression::Pass);
-        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (id, mut m) = super_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let (events, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::COMMAND));
+        let (events, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::SUPER));
         match events.as_slice() {
             [HotkeyEvent::Up { id: i, held_for }] => {
                 assert_eq!(*i, id);
@@ -288,27 +279,18 @@ mod tests {
         let id = HotkeyId(3);
         let mut m = matcher_with(
             id,
-            Hotkey::new(Modifiers::NONE, Some(Key::OptionRight)),
+            Hotkey::new(Modifiers::NONE, Some(Key::AltRight)),
             Suppression::Swallow,
         );
         // Left option: not this hotkey.
-        let (events, swallow) =
-            m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, swallow) = m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
         assert!(events.is_empty() && !swallow);
         // Right option: Down + swallow.
-        let (events, swallow) = m.handle(&ev(
-            Key::OptionRight,
-            KeyEventKind::Press,
-            Modifiers::OPTION,
-        ));
+        let (events, swallow) = m.handle(&ev(Key::AltRight, KeyEventKind::Press, Modifiers::ALT));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
         // Right released while left still held: Up.
-        let (events, _) = m.handle(&ev(
-            Key::OptionRight,
-            KeyEventKind::Release,
-            Modifiers::OPTION,
-        ));
+        let (events, _) = m.handle(&ev(Key::AltRight, KeyEventKind::Release, Modifiers::ALT));
         assert!(matches!(events.as_slice(), [HotkeyEvent::Up { id: i, .. }] if *i == id));
     }
 
@@ -318,49 +300,45 @@ mod tests {
         let id2 = HotkeyId(5);
         let mut m = matcher_with(
             id,
-            Hotkey::new(Modifiers::NONE, Some(Key::OptionRight)),
+            Hotkey::new(Modifiers::NONE, Some(Key::AltRight)),
             Suppression::Pass,
         );
         m.register(
             id2,
             Registered {
-                hotkey: Hotkey::new(Modifiers::SHIFT, Some(Key::OptionRight)),
+                hotkey: Hotkey::new(Modifiers::SHIFT, Some(Key::AltRight)),
                 suppression: Suppression::Pass,
             },
         );
-        // Shift+RightOption matches only the {SHIFT, OptionRight} hotkey.
+        // Shift+RightAlt matches only the {SHIFT, AltRight} hotkey.
         let (events, _) = m.handle(&ev(
-            Key::OptionRight,
+            Key::AltRight,
             KeyEventKind::Press,
-            Modifiers::OPTION | Modifiers::SHIFT,
+            Modifiers::ALT | Modifiers::SHIFT,
         ));
         assert_eq!(events, vec![HotkeyEvent::Down(id2)]);
-        // Plain RightOption now matches only the bare one.
-        let (events, _) = m.handle(&ev(
-            Key::OptionRight,
-            KeyEventKind::Press,
-            Modifiers::OPTION,
-        ));
+        // Plain RightAlt now matches only the bare one.
+        let (events, _) = m.handle(&ev(Key::AltRight, KeyEventKind::Press, Modifiers::ALT));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
     }
 
     #[test]
     fn disabled_matcher_emits_nothing_and_swallows_nothing() {
-        let (id, mut m) = cmd_k(Suppression::Swallow);
+        let (id, mut m) = super_k(Suppression::Swallow);
         m.set_enabled(false);
-        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         assert!(events.is_empty() && !swallow);
         // Re-enabled: matching resumes.
         m.set_enabled(true);
-        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         assert_eq!(events, vec![HotkeyEvent::Down(id)]);
         assert!(swallow);
     }
 
     #[test]
     fn disable_mid_hold_completes_on_release() {
-        let (id, mut m) = cmd_k(Suppression::Pass);
-        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::COMMAND));
+        let (id, mut m) = super_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
         m.set_enabled(false);
         // The in-flight activation completes on the real release.
         let (events, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
@@ -371,15 +349,15 @@ mod tests {
     #[test]
     fn modifier_only_held_across_disable_cycle_does_not_refire() {
         let id = HotkeyId(9);
-        let mut m = matcher_with(id, Hotkey::new(Modifiers::OPTION, None), Suppression::Pass);
-        m.handle(&ev(Key::OptionLeft, KeyEventKind::Press, Modifiers::OPTION));
+        let mut m = matcher_with(id, Hotkey::new(Modifiers::ALT, None), Suppression::Pass);
+        m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
         m.set_enabled(false);
         m.set_enabled(true);
         // Still held from before the cycle: no second Down.
-        let (events, _) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::OPTION));
+        let (events, _) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::ALT));
         assert!(events.is_empty());
         // One hold, one Up.
-        let (events, _) = m.handle(&ev(Key::OptionLeft, KeyEventKind::Release, Modifiers::NONE));
+        let (events, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
         assert!(matches!(events.as_slice(), [HotkeyEvent::Up { id: i, .. }] if *i == id));
     }
 }

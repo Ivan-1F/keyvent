@@ -62,14 +62,14 @@ pub fn key_from_code(code: Keycode) -> Key {
         50 => Key::BackQuote,
         51 => Key::Delete,
         53 => Key::Escape,
-        54 => Key::CommandRight,
-        55 => Key::CommandLeft,
+        54 => Key::SuperRight,
+        55 => Key::SuperLeft,
         56 => Key::ShiftLeft,
         57 => Key::CapsLock,
-        58 => Key::OptionLeft,
+        58 => Key::AltLeft,
         59 => Key::ControlLeft,
         60 => Key::ShiftRight,
-        61 => Key::OptionRight,
+        61 => Key::AltRight,
         62 => Key::ControlRight,
         63 => Key::Function,
         64 => Key::F17,
@@ -157,14 +157,14 @@ pub fn code_from_key(key: Key) -> Option<Keycode> {
         Key::BackQuote => 50,
         Key::Delete => 51,
         Key::Escape => 53,
-        Key::CommandRight => 54,
-        Key::CommandLeft => 55,
+        Key::SuperRight => 54,
+        Key::SuperLeft => 55,
         Key::ShiftLeft => 56,
         Key::CapsLock => 57,
-        Key::OptionLeft => 58,
+        Key::AltLeft => 58,
         Key::ControlLeft => 59,
         Key::ShiftRight => 60,
-        Key::OptionRight => 61,
+        Key::AltRight => 61,
         Key::ControlRight => 62,
         Key::Function => 63,
         Key::F17 => 64,
@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn spot_checks() {
         assert_eq!(key_from_code(63), Key::Function);
-        assert_eq!(key_from_code(55), Key::CommandLeft);
-        assert_eq!(key_from_code(54), Key::CommandRight);
+        assert_eq!(key_from_code(55), Key::SuperLeft);
+        assert_eq!(key_from_code(54), Key::SuperRight);
         assert_eq!(key_from_code(56), Key::ShiftLeft);
         assert_eq!(key_from_code(60), Key::ShiftRight);
         assert_eq!(key_from_code(90), Key::F20);
