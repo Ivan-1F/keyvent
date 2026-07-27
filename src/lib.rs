@@ -36,9 +36,10 @@ compile_error!("keyvent currently supports macOS only");
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 
-pub use event::{Key, KeyEvent, KeyEventKind, Modifiers};
+pub use event::{Key, KeyEvent, KeyEventKind, Modifiers, ParseKeyError, ParseModifiersError};
 pub use hotkey::{
-    Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, HotkeyRecorder, RecorderEvent, Suppression,
+    Hotkey, HotkeyEvent, HotkeyId, HotkeyManager, HotkeyRecorder, ParseHotkeyError, RecorderEvent,
+    Suppression,
 };
 
 use crate::dispatcher::{Dispatcher, DispatcherCommand};
