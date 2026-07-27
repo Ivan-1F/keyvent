@@ -14,9 +14,9 @@
 //! action is *tearing down*, which always moves the system toward safety.
 
 use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,9 @@ use objc2_core_graphics::{
 };
 
 use crate::Status;
-use crate::tap::{TapShared, TapThread};
+use crate::status::StatusBroadcast;
+
+use super::{TapShared, TapThread};
 
 const TICK: Duration = Duration::from_millis(200);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -130,55 +132,8 @@ impl Supervisor {
         // a user callback and can never process the Shutdown command.
         self.shared.force_invalidate();
         if let Some(join) = self.join.take() {
-            crate::tap::join_with_timeout(join, SHUTDOWN_JOIN_TIMEOUT, "supervisor");
+            crate::platform::join_with_timeout(join, SHUTDOWN_JOIN_TIMEOUT, "supervisor");
         }
-    }
-}
-
-/// Fan-out of lifecycle status changes: a current-value cell plus a list of
-/// bounded subscriber channels. The supervisor is the only publisher.
-pub(crate) struct StatusBroadcast {
-    current: AtomicU8,
-    subscribers: Mutex<Vec<mpsc::SyncSender<Status>>>,
-}
-
-impl StatusBroadcast {
-    pub(crate) fn new(initial: Status) -> Self {
-        Self {
-            current: AtomicU8::new(initial as u8),
-            subscribers: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Current lifecycle status.
-    pub(crate) fn current(&self) -> Status {
-        Status::from_u8(self.current.load(SeqCst))
-    }
-
-    /// A new subscriber channel. Bounded: if nobody drains it, new statuses
-    /// are dropped rather than queueing forever — `current()` always has the
-    /// latest value.
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<Status> {
-        let (tx, rx) = mpsc::sync_channel(16);
-        self.subscribers.lock().unwrap().push(tx);
-        rx
-    }
-
-    /// Publish a status change: update the current-value cell and queue the
-    /// change for all subscribers. No-op if the status is unchanged. A full
-    /// channel drops the change silently; subscribers whose receiver is gone
-    /// (guard dropped) are pruned lazily.
-    pub(crate) fn publish(&self, next: Status) {
-        let prev = self.current.swap(next as u8, SeqCst);
-        if prev == next as u8 {
-            return;
-        }
-        log::info!("keyvent: status {:?} -> {next:?}", Status::from_u8(prev));
-        let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|tx| match tx.try_send(next) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
-        });
     }
 }
 

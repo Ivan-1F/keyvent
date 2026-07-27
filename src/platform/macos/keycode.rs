@@ -6,8 +6,7 @@
 
 use crate::Key;
 
-/// macOS virtual keycode.
-pub type Keycode = u16;
+pub(crate) use crate::platform::Keycode;
 
 pub fn key_from_code(code: Keycode) -> Key {
     match code {

@@ -4,9 +4,11 @@
 //! suppress it.
 
 use crate::KeyEvent;
-use crate::tap::BoxedCallback;
 use std::sync::Weak;
 use std::sync::mpsc;
+
+/// A registered user callback: event in, swallow decision out.
+pub(crate) type BoxedCallback = Box<dyn FnMut(KeyEvent) -> bool + Send>;
 
 pub(crate) enum DispatcherCommand {
     Add(BoxedCallback, Weak<()>),

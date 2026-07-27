@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 
-use crate::keycode::Keycode;
+use crate::platform::Keycode;
 
 /// What the tap layer should do with a converted event on the consumer side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

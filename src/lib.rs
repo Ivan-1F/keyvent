@@ -26,9 +26,13 @@
 mod dispatcher;
 mod event;
 pub mod hotkey;
-mod keycode;
-mod supervisor;
-mod tap;
+mod pairing;
+mod platform;
+mod status;
+mod suppress;
+
+#[cfg(not(target_os = "macos"))]
+compile_error!("keyvent currently supports macOS only");
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 
@@ -38,7 +42,8 @@ pub use hotkey::{
 };
 
 use crate::dispatcher::{Dispatcher, DispatcherCommand};
-use supervisor::StatusBroadcast;
+use crate::platform::macos::{Supervisor, TapShared, TapThread};
+use status::StatusBroadcast;
 
 /// Lifecycle status of the event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,21 +76,21 @@ static ENGINE: Mutex<Option<Weak<Engine>>> = Mutex::new(None);
 /// guards. Created by the first `start`; dropped — and shut down — when the
 /// last guard drops.
 struct Engine {
-    supervisor: Option<supervisor::Supervisor>,
+    supervisor: Option<Supervisor>,
     commands: mpsc::Sender<DispatcherCommand>,
     broadcast: Arc<StatusBroadcast>,
 }
 
 impl Engine {
     fn spawn() -> Arc<Self> {
-        let shared = Arc::new(tap::TapShared::new());
+        let shared = Arc::new(TapShared::new());
         let (commands, mut dispatcher) = Dispatcher::new();
-        let tap = tap::TapThread::spawn(
+        let tap = TapThread::spawn(
             Box::new(move |event| dispatcher.handle(event)),
             shared.clone(),
         );
         let broadcast = Arc::new(StatusBroadcast::new(Status::Silent));
-        let supervisor = supervisor::Supervisor::spawn(tap, shared, broadcast.clone());
+        let supervisor = Supervisor::spawn(tap, shared, broadcast.clone());
         Arc::new(Self {
             supervisor: Some(supervisor),
             commands,

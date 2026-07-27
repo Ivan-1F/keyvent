@@ -11,8 +11,10 @@
 //!   what keeps a wedged callback from freezing the keyboard.
 
 mod convert;
-mod pairing;
-mod suppress;
+mod keycode;
+pub(crate) mod supervisor;
+
+pub(crate) use supervisor::Supervisor;
 
 use std::ffi::c_void;
 use std::ptr::{NonNull, null_mut};
@@ -31,12 +33,13 @@ use objc2_core_graphics::{
     CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
 
-use crate::keycode::{self, Keycode};
+use self::keycode::Keycode;
+use crate::dispatcher::BoxedCallback;
 use crate::{KeyEvent, KeyEventKind, Modifiers};
 
+use crate::pairing::{Pairing, Plan};
+use crate::suppress::{Action, Suppression};
 use convert::{ModifierTracker, RawKind};
-use pairing::{Pairing, Plan};
-use suppress::{Action, Suppression};
 
 /// Keyboard-only mask: mouse/scroll/gesture events never route through the tap,
 /// so a stalled tap cannot freeze pointer input.
@@ -53,9 +56,6 @@ const HEARTBEAT_KEYCODE: Keycode = 90;
 /// Marker in the high 32 bits of `kCGEventSourceUserData` for our own injected
 /// events.
 const MAGIC_HIGH: i64 = 0x4B56_5400_0000_0000;
-
-/// A registered user callback: event in, swallow decision out.
-pub(crate) type BoxedCallback = Box<dyn FnMut(KeyEvent) -> bool + Send>;
 
 /// State shared between the tap thread and the supervisor thread.
 pub(crate) struct TapShared {
@@ -167,25 +167,9 @@ impl TapThread {
     pub(crate) fn shutdown(mut self) {
         let _ = self.cmd.send(TapCommand::Shutdown);
         if let Some(join) = self.join.take() {
-            join_with_timeout(join, Duration::from_secs(2), "tap");
+            crate::platform::join_with_timeout(join, Duration::from_secs(2), "tap");
         }
     }
-}
-
-/// Join a thread, but detach instead of hanging forever if it is stuck
-/// (e.g. the tap thread blocked inside a misbehaving user callback).
-pub(crate) fn join_with_timeout(join: JoinHandle<()>, timeout: Duration, name: &str) {
-    let start = Instant::now();
-    while !join.is_finished() {
-        if start.elapsed() > timeout {
-            log::warn!(
-                "keyvent: {name} thread did not exit in time; detached (tap already invalidated)"
-            );
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let _ = join.join();
 }
 
 /// Everything the tap callback needs, living on the tap thread's stack.

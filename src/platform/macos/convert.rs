@@ -14,7 +14,7 @@
 //! `MaskSecondaryFn`) are not shared between keys, so press/release is read
 //! directly from the snapshot.
 
-use crate::keycode::{self, Keycode};
+use super::keycode::{self, Keycode};
 use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
 
 /// Side-specific held state for the eight modifier keys.
