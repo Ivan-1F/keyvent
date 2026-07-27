@@ -3,6 +3,8 @@
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows;
 
 use std::thread::JoinHandle;
 use std::time::Duration;
