@@ -2,63 +2,21 @@
 
 Global keyboard event stream for macOS, with automatic Accessibility permission lifecycle management.
 
-## Motivation
-
-macOS event taps are not create-once resources.
-The system disables them when the callback is slow, and stops delivering events when Accessibility permission is revoked at runtime — without reliably notifying the process.
-A tap left installed after revocation can block event delivery to the entire session; apps built on the common hotkey libraries have frozen whole machines this way ([example incident](https://github.com/cjpais/Handy/issues/1281)).
-
-The status APIs don't help: `AXIsProcessTrusted()` can return stale results for a running process, and the tap-disabled notification does not reliably fire.
-keyvent instead detects permission state through functional probes, tears the tap down proactively on revocation, and rebuilds it when permission returns — all without application code.
-
-## Features
-
-- `Press`/`Release` events for all keys, with side-specific modifier keys and Fn/Globe support.
-- Optional per-event suppression, with consistency enforced on the OS side (a suppressed press always suppresses its release, and vice versa for passed events).
-- A paired event stream: per key, events strictly alternate `Press`/`Release`, including across permission changes and tap rebuilds.
-- A keyboard-only event mask: pointer events never pass through the tap.
-- Automatic handling of permission grant, revocation, and re-grant; recovery from tap timeouts, sleep/wake, and secure-input interruptions.
-
-## Install
-
-```toml
-[dependencies]
-keyvent = "0.1"
-```
-
 ## Usage
 
-```rust
+```no_run
+// This will return immediately.
 let guard = keyvent::start(|event| {
-    println!("{:?} {:?} {:?}", event.kind, event.key, event.modifiers);
-    false // return true to suppress the event
+    // Return true to suppress the event system-wide.
+    event.key == keyvent::Key::F5
 });
+// Dropping the guard stops the callback, dropping the last guard stops everything cleanly.
 ```
 
-`start` returns immediately in all cases, including when permission is missing.
-Drop the returned `Guard` to stop.
+## Platform Caveats
 
-All `start` calls share one process-wide engine (a single event tap): each call registers an additional callback, an event is suppressed if any callback returns `true`, and the engine shuts down when the last `Guard` is dropped.
+### macOS
 
-Suppression (returning `true`) is only consulted for presses; releases always follow the press decision.
+The process needs to be granted the Accessibility permission (System Preferences > Privacy & Security > Accessibility)
 
-To observe the permission lifecycle:
-
-```rust
-std::thread::spawn(move || {
-    while let Ok(status) = guard.status_receiver().recv() {
-        // Status::Running | Status::Silent | Status::Cooldown
-    }
-});
-```
-
-## Callback contract
-
-The callback runs on the event-tap thread, on the delivery path of every keystroke in the session.
-It must return quickly: no blocking, no waiting on contended locks, no synchronous cross-thread calls.
-Move work to another thread (e.g. by sending the event over a channel).
-
-## Permissions
-
-Filtering keyboard events requires the **Accessibility** permission (System Settings → Privacy & Security → Accessibility).
-Without it, `start` stays silent; there is no error path to handle.
+Without Accessibility permission, the stream simply stays silent; the stream starts automatically once permission is granted, and stops cleanly on revocation.
