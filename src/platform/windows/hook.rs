@@ -24,11 +24,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::convert::Tracker;
 use super::keycode::{self, Keycode};
+use crate::Status;
 use crate::dispatcher::BoxedCallback;
-use crate::pairing::{Pairing, Plan};
+use crate::pairing::Pairing;
+use crate::route;
 use crate::status::StatusBroadcast;
 use crate::suppress::{Action, Suppression};
-use crate::{KeyEvent, KeyEventKind, Status};
 
 /// Handle to the running hook thread.
 pub(crate) struct HookThread {
@@ -115,8 +116,8 @@ fn thread_main(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>, id_tx: 
     // The stream ends here: close every dangling consumer-side press.
     let dangling = ctx.pairing.close_all();
     for code in dangling {
-        let event = synthetic_release(&ctx, code);
-        dispatch(&mut ctx, event);
+        let event = route::synthetic_release(keycode::key_from_code(code), ctx.tracker.snapshot());
+        route::dispatch(&mut ctx.callback, event);
     }
     HOOK_CTX.with(|c| c.set(null_mut()));
     log::debug!("keyvent: hook thread exited");
@@ -140,12 +141,30 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             // events) before converting the new event.
             let skip = (!down).then_some(code);
             for stale in ctx.tracker.reconcile(is_queryable_held, skip) {
-                route(ctx, stale, synthetic_release(ctx, stale));
+                let event =
+                    route::synthetic_release(keycode::key_from_code(stale), ctx.tracker.snapshot());
+                route::route(
+                    &mut ctx.pairing,
+                    &mut ctx.suppression,
+                    &mut ctx.callback,
+                    stale,
+                    event,
+                    || ctx.tracker.snapshot(),
+                );
             }
             let swallow = match ctx.tracker.convert(code, down) {
                 // A duplicate modifier press leaves the stream silently.
                 None => true,
-                Some(event) => route(ctx, code, event),
+                Some(event) => {
+                    route::route(
+                        &mut ctx.pairing,
+                        &mut ctx.suppression,
+                        &mut ctx.callback,
+                        code,
+                        event,
+                        || ctx.tracker.snapshot(),
+                    ) == Action::Swallow
+                }
             };
             if swallow {
                 return 1;
@@ -153,58 +172,6 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
-}
-
-/// Route one converted event through the ledgers and the callback. Returns
-/// whether the raw event is swallowed.
-fn route(ctx: &mut Ctx, code: Keycode, event: KeyEvent) -> bool {
-    // Consumer side: the pairing ledger decides what the callback may see.
-    // OS side: the suppression ledger decides the raw event's fate. The two
-    // are independent — e.g. an orphan release is hidden from the consumer
-    // but still passed through if the OS saw its press.
-    match event.kind {
-        KeyEventKind::Press => {
-            if ctx.pairing.press(code, event.is_repeat) == Plan::CloseThenDeliver {
-                // A previous release was lost: close the dangling press first.
-                dispatch(ctx, synthetic_release(ctx, code));
-            }
-            let user_swallow = dispatch(ctx, event);
-            ctx.suppression.press(code, event.is_repeat, user_swallow) == Action::Swallow
-        }
-        KeyEventKind::Release => {
-            if ctx.pairing.release(code) == Plan::Deliver {
-                dispatch(ctx, event);
-            }
-            // The release's swallow decision is derived from the press
-            // (see Suppression); the callback is not consulted.
-            ctx.suppression.release(code) == Action::Swallow
-        }
-    }
-}
-
-/// Dispatch one event to the callback. Last-resort boundary: the dispatcher
-/// isolates user-callback panics itself, so this only catches panics in the
-/// dispatch machinery — which must never unwind into the message loop.
-/// Returns the callback's swallow decision (false on panic).
-fn dispatch(ctx: &mut Ctx, event: KeyEvent) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ctx.callback)(event))) {
-        Ok(swallow) => swallow,
-        Err(_) => {
-            log::error!("keyvent: callback dispatch panicked; event passed through");
-            false
-        }
-    }
-}
-
-/// A synthetic Release closing a dangling consumer-side press; the snapshot
-/// is the self-tracked one (the hook provides none).
-fn synthetic_release(ctx: &Ctx, code: Keycode) -> KeyEvent {
-    KeyEvent {
-        key: keycode::key_from_code(code),
-        kind: KeyEventKind::Release,
-        modifiers: ctx.tracker.snapshot(),
-        is_repeat: false,
-    }
 }
 
 /// Physical held-state query for install-time seeding.

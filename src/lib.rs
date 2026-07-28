@@ -28,6 +28,7 @@ mod event;
 pub mod hotkey;
 mod pairing;
 mod platform;
+mod route;
 mod status;
 mod suppress;
 

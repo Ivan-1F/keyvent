@@ -34,10 +34,11 @@ use objc2_core_graphics::{
 };
 
 use self::keycode::Keycode;
+use crate::Modifiers;
 use crate::dispatcher::BoxedCallback;
-use crate::{KeyEvent, KeyEventKind, Modifiers};
 
-use crate::pairing::{Pairing, Plan};
+use crate::pairing::Pairing;
+use crate::route;
 use crate::suppress::{Action, Suppression};
 use convert::{ModifierTracker, RawKind};
 
@@ -331,27 +332,9 @@ fn reconcile_books(ctx: &mut Ctx) {
 
 fn emit_synthetic_releases(ctx: &mut Ctx, codes: Vec<Keycode>) {
     for code in codes {
-        let event = KeyEvent {
-            key: keycode::key_from_code(code),
-            kind: KeyEventKind::Release,
-            modifiers: current_modifier_snapshot(),
-            is_repeat: false,
-        };
-        dispatch(ctx, event);
-    }
-}
-
-/// Dispatch one event to the callback. Last-resort FFI boundary: the
-/// dispatcher isolates user-callback panics itself, so this only catches
-/// panics in the dispatch machinery — which must never unwind into the
-/// CF run loop. Returns the callback's swallow decision (false on panic).
-fn dispatch(ctx: &mut Ctx, event: KeyEvent) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ctx.callback)(event))) {
-        Ok(swallow) => swallow,
-        Err(_) => {
-            log::error!("keyvent: callback dispatch panicked; event passed through");
-            false
-        }
+        let event =
+            route::synthetic_release(keycode::key_from_code(code), current_modifier_snapshot());
+        route::dispatch(&mut ctx.callback, event);
     }
 }
 
@@ -472,42 +455,15 @@ unsafe extern "C-unwind" fn raw_callback(
         kind,
     );
 
-    // Consumer side: pairing ledger decides what the callback may see.
-    // OS side: suppression bookkeeping decides what happens to the raw event.
-    // The two ledgers are independent — e.g. an orphan release is hidden from
-    // the consumer but still passed through to the OS if the OS saw its press.
-    match key_event.kind {
-        KeyEventKind::Press => {
-            if ctx.pairing.press(keycode, is_repeat) == Plan::CloseThenDeliver {
-                // A previous release was lost: close the dangling press first.
-                dispatch(ctx, synthetic_release(keycode));
-            }
-            let user_swallow = dispatch(ctx, key_event);
-            match ctx.suppression.press(keycode, is_repeat, user_swallow) {
-                Action::Swallow => null_mut(),
-                Action::Pass => event.as_ptr(),
-            }
-        }
-        KeyEventKind::Release => {
-            let deliver = ctx.pairing.release(keycode) == Plan::Deliver;
-            if deliver {
-                dispatch(ctx, key_event);
-            }
-            // The release's swallow decision is derived from the press
-            // (see Suppression); the callback is not consulted.
-            match ctx.suppression.release(keycode) {
-                Action::Swallow => null_mut(),
-                Action::Pass => event.as_ptr(),
-            }
-        }
-    }
-}
-
-fn synthetic_release(code: Keycode) -> KeyEvent {
-    KeyEvent {
-        key: keycode::key_from_code(code),
-        kind: KeyEventKind::Release,
-        modifiers: current_modifier_snapshot(),
-        is_repeat: false,
+    match route::route(
+        &mut ctx.pairing,
+        &mut ctx.suppression,
+        &mut ctx.callback,
+        keycode,
+        key_event,
+        current_modifier_snapshot,
+    ) {
+        Action::Swallow => null_mut(),
+        Action::Pass => event.as_ptr(),
     }
 }
