@@ -272,6 +272,20 @@ fn install(ctx: &mut Ctx) -> bool {
         log::error!("keyvent: failed to create run loop source");
         return false;
     };
+    // Initialize modifier tracking from physical truth, so keys held while the
+    // stream starts are tracked correctly instead of guessed later.
+    ctx.tracker.init_from_physical(|code| {
+        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+    });
+    // Reconcile the ledgers against physical truth now — not at teardown: the
+    // query needs the permission we only know is present right now. Presses
+    // physically released while the stream was down close with synthetic
+    // releases; keys still held stay open and close on their real release.
+    reconcile_books(ctx);
+    // Only now wire the tap into the event chain: events delivered after this
+    // point meet ledgers that already match physical truth. Enabling earlier
+    // would let a release generated before reconcile slip past the ledger it
+    // just cleared (a phantom release for the OS).
     let run_loop = CFRunLoop::current().unwrap();
     unsafe { run_loop.add_source(Some(&source), kCFRunLoopCommonModes) };
     CGEvent::tap_enable(&tap, true);
@@ -279,27 +293,16 @@ fn install(ctx: &mut Ctx) -> bool {
     ctx.tap = Some(tap);
     ctx.source = Some(source);
     ctx.hb_next = Instant::now();
-    // Initialize modifier tracking from physical truth, so keys held while the
-    // stream starts are tracked correctly instead of guessed later.
-    ctx.tracker.init_from_physical(|code| {
-        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
-    });
     log::info!("keyvent: event tap installed");
     true
 }
 
 /// Full teardown: remove from run loop, disable, invalidate. Safe to call with
-/// no tap installed. Closing the stream means every unclosed consumer-side
-/// press is completed with a synthetic release.
+/// no tap installed. The ledgers are deliberately left untouched: presses stay
+/// open so they can be reconciled against physical truth at the next install —
+/// synthesizing releases here would fabricate events for keys the user may
+/// still be holding.
 fn teardown(ctx: &mut Ctx) {
-    // OS-side book: drop entries whose key is physically up so a later rebuild
-    // doesn't force-swallow releases for presses the OS actually saw.
-    ctx.suppression.reconcile(|code| {
-        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
-    });
-    // Consumer-side ledger: the stream ends here, close everything.
-    let dangling = ctx.pairing.close_all();
-    emit_synthetic_releases(ctx, dangling);
     drop_local_tap(ctx);
     ctx.shared.handle.lock().unwrap().take();
 }
@@ -317,9 +320,10 @@ fn drop_local_tap(ctx: &mut Ctx) {
     }
 }
 
-/// Recovery reconcile after a tap-disabled event (timeout / userInput): the
-/// stream continues, so only presses whose key is physically up are closed —
-/// keys still held stay open and close on their real release.
+/// Reconcile the ledgers against physical key state. Called at tap install
+/// (rebuild after permission loss) and on tap-disabled recovery (timeout):
+/// presses whose key is physically up are closed with synthetic releases,
+/// while keys still held stay open and close on their real release.
 fn reconcile_books(ctx: &mut Ctx) {
     ctx.suppression.reconcile(|code| {
         CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)

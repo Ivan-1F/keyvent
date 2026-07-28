@@ -113,12 +113,6 @@ fn thread_main(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>, id_tx: 
         UnhookWindowsHookEx(hook);
     }
 
-    // The stream ends here: close every dangling consumer-side press.
-    let dangling = ctx.pairing.close_all();
-    for code in dangling {
-        let event = route::synthetic_release(keycode::key_from_code(code), ctx.tracker.snapshot());
-        route::dispatch(&mut ctx.callback, event);
-    }
     HOOK_CTX.with(|c| c.set(null_mut()));
     log::debug!("keyvent: hook thread exited");
 }

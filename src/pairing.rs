@@ -1,20 +1,22 @@
 //! Consumer-stream pairing ledger: guarantees the callback sees a strictly
-//! alternating Press/Release sequence per key, fully closed at stream end.
+//! alternating Press/Release sequence per key, and that every release it sees
+//! is backed by physical truth.
 //!
 //! Why this exists: the OS event stream can start mid-hold (tap installed
-//! while keys are down) and can lose events (tap disabled windows). Without a
-//! ledger the callback would see orphan releases — or, worse, dangling presses
-//! that never close. The rules:
+//! while keys are down) and can lose events (tap disabled windows, permission
+//! gaps). Without a ledger the callback would see orphan releases — or, worse,
+//! dangling presses that never close. The rules:
 //!
 //! 1. **Orphan releases are dropped** (consumer side only; the OS pass-through
 //!    is a separate concern handled by `suppression`).
 //! 2. **A re-press without an intervening release first emits a synthetic
 //!    Release** — the stream self-heals through natural use.
-//! 3. **Recovery reconcile** (after a tap timeout): dangling presses whose key
-//!    is physically up are closed with synthetic releases; keys still held stay
-//!    open and close naturally later.
-//! 4. **Teardown closes everything**: the stream is over, so every dangling
-//!    press is closed with a synthetic release regardless of physical state.
+//! 3. **Reconcile at recovery and at rebuild** (tap timeout recovery, tap
+//!    install): dangling presses whose key is physically up are closed with
+//!    synthetic releases; keys still held stay open and close on their real
+//!    release. Nothing is closed at teardown: the physical query is only
+//!    trustworthy while permission is present, and closing a held key would
+//!    fabricate a release the user never made.
 //!
 //! Synthetic events are only ever Releases completing an already-delivered
 //! Press. Presses are never fabricated: fabricating a Press could trigger
@@ -83,11 +85,6 @@ impl Pairing {
         }
         released
     }
-
-    /// Close every dangling press (stream teardown). Returns all keycodes.
-    pub(crate) fn close_all(&mut self) -> Vec<Keycode> {
-        self.pressed.drain().collect()
-    }
 }
 
 #[cfg(test)]
@@ -141,17 +138,5 @@ mod tests {
         assert_eq!(released, vec![36]);
         // 56 stays open and closes naturally later.
         assert_eq!(p.release(56), Plan::Deliver);
-    }
-
-    #[test]
-    fn close_all_at_teardown() {
-        let mut p = Pairing::default();
-        p.press(36, false);
-        p.press(56, false);
-        let mut closed = p.close_all();
-        closed.sort();
-        assert_eq!(closed, vec![36, 56]);
-        // Stream fully closed; subsequent releases are orphans.
-        assert_eq!(p.release(36), Plan::Drop);
     }
 }
