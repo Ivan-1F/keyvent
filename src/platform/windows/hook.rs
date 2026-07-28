@@ -14,8 +14,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, VK_DOWN, VK_LEFT, VK_LWIN, VK_RCONTROL,
-    VK_RIGHT, VK_RMENU, VK_RWIN, VK_UP,
+    GetAsyncKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_NOREMOVE,
@@ -137,6 +136,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
             let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let code = keycode::encode(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0);
+            // Close keys whose release was missed (secure desktop, skipped
+            // events) before converting the new event.
+            let skip = (!down).then_some(code);
+            for stale in ctx.tracker.reconcile(is_queryable_held, skip) {
+                route(ctx, stale, synthetic_release(ctx, stale));
+            }
             let swallow = match ctx.tracker.convert(code, down) {
                 // A duplicate modifier press leaves the stream silently.
                 None => true,
@@ -207,22 +212,20 @@ fn is_physically_held(code: Keycode) -> bool {
     unsafe { (GetAsyncKeyState(vk_of(code)) as u16) & 0x8000 != 0 }
 }
 
-/// The virtual-key code a keycode's state is reported under. Scan codes go
-/// through MapVirtualKey; the extended keys our encoding distinguishes are
-/// disambiguated by hand, since MapVirtualKey cannot express the extended
-/// bit.
+/// Physical held-state query for reconcile; keys with no VK mapping report as
+/// held — they cannot be verified, so the event stream stays their truth.
+fn is_queryable_held(code: Keycode) -> bool {
+    vk_of(code) != 0 && is_physically_held(code)
+}
+
+/// The virtual-key code a keycode's state is reported under. MAPVK_VSC_TO_VK_EX
+/// honors the 0xE0 prefix in the scan code's high byte, so extended codes map
+/// to their extended virtual keys directly; only VK-encoded codes are special.
 fn vk_of(code: Keycode) -> i32 {
-    let vk = match code {
-        0xE01D => VK_RCONTROL as u32,
-        0xE038 => VK_RMENU as u32,
-        0xE048 => VK_UP as u32,
-        0xE04B => VK_LEFT as u32,
-        0xE04D => VK_RIGHT as u32,
-        0xE050 => VK_DOWN as u32,
-        0xE05B => VK_LWIN as u32,
-        0xE05C => VK_RWIN as u32,
-        _ if code & 0xFF00 == 0xF000 => (code & 0xFF) as u32,
-        _ => unsafe { MapVirtualKeyW((code & 0xFF) as u32, MAPVK_VSC_TO_VK_EX) },
+    let vk = if code & 0xFF00 == 0xF000 {
+        (code & 0xFF) as u32
+    } else {
+        unsafe { MapVirtualKeyW(code as u32, MAPVK_VSC_TO_VK_EX) }
     };
     vk as i32
 }

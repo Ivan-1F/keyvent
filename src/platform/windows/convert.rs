@@ -6,18 +6,21 @@
 //! the snapshot folds the currently-held modifier keys, and a press arriving
 //! for an already-held key is a repeat. A duplicate modifier press is dropped
 //! instead of reported: macOS never emits one, and reporting it would let
-//! suppression re-decide an already-booked press cycle.
+//! suppression re-decide an already-booked press cycle. The hook can miss
+//! releases (secure desktop, skipped events), so tracked state is reconciled
+//! against physical key state on every event — the role the OS-provided
+//! snapshot plays in the macOS tracker.
 
 use std::collections::HashSet;
 
 use super::keycode::{self, Keycode};
-use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
+use crate::{KeyEvent, KeyEventKind, Modifiers};
 
 /// Tracks held keys across events to synthesize the snapshot and the repeat
 /// flag the hook does not provide. Hook-thread local.
 #[derive(Default)]
 pub(crate) struct Tracker {
-    pressed: HashSet<Key>,
+    pressed: HashSet<Keycode>,
 }
 
 impl Tracker {
@@ -29,7 +32,7 @@ impl Tracker {
         let key = keycode::key_from_code(code);
         let mut is_repeat = false;
         let kind = if down {
-            if self.pressed.insert(key) {
+            if self.pressed.insert(code) {
                 KeyEventKind::Press
             } else if key.modifier_group().is_some() {
                 return None;
@@ -38,7 +41,7 @@ impl Tracker {
                 KeyEventKind::Press
             }
         } else {
-            self.pressed.remove(&key);
+            self.pressed.remove(&code);
             KeyEventKind::Release
         };
         Some(KeyEvent {
@@ -56,16 +59,37 @@ impl Tracker {
         self.pressed.clear();
         for code in keycode::all_codes() {
             if is_held(code) {
-                self.pressed.insert(keycode::key_from_code(code));
+                self.pressed.insert(code);
             }
         }
+    }
+
+    /// Drop tracked keys that are physically released — their releases were
+    /// missed — and return them for synthetic-release closing. `skip` keeps
+    /// the current release's own key: tracked-but-released is the state that
+    /// release is about to resolve, not drift.
+    pub(crate) fn reconcile(
+        &mut self,
+        is_held: impl Fn(Keycode) -> bool,
+        skip: Option<Keycode>,
+    ) -> Vec<Keycode> {
+        let stale: Vec<Keycode> = self
+            .pressed
+            .iter()
+            .filter(|code| Some(**code) != skip && !is_held(**code))
+            .copied()
+            .collect();
+        for code in &stale {
+            self.pressed.remove(code);
+        }
+        stale
     }
 
     /// The current modifier snapshot: the groups of the held modifier keys.
     pub(crate) fn snapshot(&self) -> Modifiers {
         let mut snapshot = Modifiers::NONE;
-        for &key in &self.pressed {
-            if let Some(group) = key.modifier_group() {
+        for &code in &self.pressed {
+            if let Some(group) = keycode::key_from_code(code).modifier_group() {
                 snapshot |= group;
             }
         }
@@ -76,6 +100,7 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Key;
 
     fn ev(key: Key, kind: KeyEventKind, mods: Modifiers, is_repeat: bool) -> KeyEvent {
         KeyEvent {
@@ -188,6 +213,50 @@ mod tests {
             e,
             ev(Key::KeyA, KeyEventKind::Release, Modifiers::NONE, false)
         );
+    }
+
+    #[test]
+    fn reconcile_is_a_no_op_when_consistent() {
+        let mut t = Tracker::default();
+        t.convert(0x1E, true).unwrap();
+        assert!(t.reconcile(|_| true, None).is_empty());
+        // Still tracked: a second press reads as a repeat.
+        assert!(t.convert(0x1E, true).unwrap().is_repeat);
+    }
+
+    #[test]
+    fn reconcile_drops_physically_released() {
+        let mut t = Tracker::default();
+        t.convert(0x2A, true).unwrap(); // ShiftLeft down
+        t.convert(0x1E, true).unwrap(); // KeyA down
+        // ShiftLeft's release was missed; KeyA is still held.
+        let stale = t.reconcile(|code| code == 0x1E, None);
+        assert_eq!(stale, vec![0x2A]);
+        // The phantom group bit is gone from subsequent snapshots.
+        let e = t.convert(0x1F, true).unwrap();
+        assert_eq!(e.modifiers, Modifiers::NONE);
+    }
+
+    #[test]
+    fn reconcile_makes_the_next_press_fresh() {
+        let mut t = Tracker::default();
+        t.convert(0x2A, true).unwrap();
+        // The release was missed and the key is pressed again after the gap:
+        // without reconcile this down would vanish as a duplicate.
+        assert_eq!(t.reconcile(|_| false, None), vec![0x2A]);
+        let e = t.convert(0x2A, true).unwrap();
+        assert_eq!(e.kind, KeyEventKind::Press);
+        assert!(!e.is_repeat);
+    }
+
+    #[test]
+    fn reconcile_skips_the_current_release() {
+        let mut t = Tracker::default();
+        t.convert(0x1E, true).unwrap();
+        // The real release is arriving now: tracked-but-released is expected.
+        assert!(t.reconcile(|_| false, Some(0x1E)).is_empty());
+        let e = t.convert(0x1E, false).unwrap();
+        assert_eq!(e.kind, KeyEventKind::Release);
     }
 
     #[test]
