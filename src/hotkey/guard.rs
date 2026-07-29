@@ -23,7 +23,7 @@ use super::{Hotkey, Suppression};
 
 /// A hotkey activation or deactivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingEvent {
+pub enum HotkeyEvent {
     /// The hotkey became active.
     Down,
     /// The hotkey became inactive; `held_for` is how long it was active.
@@ -36,7 +36,7 @@ pub enum BindingEvent {
 /// HotkeyGuards share the process-wide keyvent engine (see [`crate::start`]).
 pub struct HotkeyGuard {
     commands: mpsc::Sender<Command>,
-    events: mpsc::Receiver<BindingEvent>,
+    events: mpsc::Receiver<HotkeyEvent>,
     engine: Guard,
 }
 
@@ -71,8 +71,8 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
         // Recording sessions pause every on guard; an in-flight activation
         // still completes on release, per the matcher's enabled semantics.
         matcher.set_enabled(enabled && RECORDING.load(Ordering::Relaxed) == 0);
-        let (binding_event, swallow) = matcher.handle(&event);
-        if let Some(e) = binding_event {
+        let (hotkey_event, swallow) = matcher.handle(&event);
+        if let Some(e) = hotkey_event {
             let _ = tx.send(e);
         }
         swallow
@@ -86,27 +86,27 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
 
 impl HotkeyGuard {
     /// Block until the next activation, `Err` once the engine is gone.
-    pub fn recv(&self) -> Result<BindingEvent, mpsc::RecvError> {
+    pub fn recv(&self) -> Result<HotkeyEvent, mpsc::RecvError> {
         self.events.recv()
     }
 
     /// The next activation if one is pending.
-    pub fn try_recv(&self) -> Result<BindingEvent, mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<HotkeyEvent, mpsc::TryRecvError> {
         self.events.try_recv()
     }
 
     /// Block up to `timeout` for the next activation.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<BindingEvent, mpsc::RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<HotkeyEvent, mpsc::RecvTimeoutError> {
         self.events.recv_timeout(timeout)
     }
 
     /// An iterator blocking on each activation.
-    pub fn iter(&self) -> mpsc::Iter<'_, BindingEvent> {
+    pub fn iter(&self) -> mpsc::Iter<'_, HotkeyEvent> {
         self.events.iter()
     }
 
     /// An iterator over the pending activations.
-    pub fn try_iter(&self) -> mpsc::TryIter<'_, BindingEvent> {
+    pub fn try_iter(&self) -> mpsc::TryIter<'_, HotkeyEvent> {
         self.events.try_iter()
     }
 
@@ -160,8 +160,8 @@ impl Matcher {
 
     /// Process one event. Returns the activation event to emit, if any, and
     /// whether the raw event should be swallowed.
-    fn handle(&mut self, event: &KeyEvent) -> (Option<BindingEvent>, bool) {
-        let mut binding_event = None;
+    fn handle(&mut self, event: &KeyEvent) -> (Option<HotkeyEvent>, bool) {
+        let mut hotkey_event = None;
         match self.hotkey.key() {
             Some(trigger) => {
                 if event.key == trigger && !event.is_repeat {
@@ -169,10 +169,10 @@ impl Matcher {
                         KeyEventKind::Press if self.enabled && self.active.is_none() => {
                             if self.hotkey.modifiers_match(event.modifiers) {
                                 self.active = Some(Instant::now());
-                                binding_event = Some(BindingEvent::Down);
+                                hotkey_event = Some(HotkeyEvent::Down);
                             }
                         }
-                        KeyEventKind::Release => binding_event = self.deactivate(),
+                        KeyEventKind::Release => hotkey_event = self.deactivate(),
                         _ => {}
                     }
                 }
@@ -181,10 +181,10 @@ impl Matcher {
                 if self.hotkey.modifiers_match(event.modifiers) {
                     if self.enabled && self.active.is_none() {
                         self.active = Some(Instant::now());
-                        binding_event = Some(BindingEvent::Down);
+                        hotkey_event = Some(HotkeyEvent::Down);
                     }
                 } else if !event.modifiers.contains(self.hotkey.modifiers()) {
-                    binding_event = self.deactivate();
+                    hotkey_event = self.deactivate();
                 }
             }
         }
@@ -197,12 +197,12 @@ impl Matcher {
             && self.suppression == Suppression::Swallow
             && self.hotkey.involves(event.key)
             && self.active.is_some();
-        (binding_event, swallow)
+        (hotkey_event, swallow)
     }
 
     /// End the activation, emitting Up with the held duration if active.
-    fn deactivate(&mut self) -> Option<BindingEvent> {
-        self.active.take().map(|started| BindingEvent::Up {
+    fn deactivate(&mut self) -> Option<HotkeyEvent> {
+        self.active.take().map(|started| HotkeyEvent::Up {
             held_for: started.elapsed(),
         })
     }
@@ -243,7 +243,7 @@ mod tests {
         assert!(event.is_none() && !swallow);
         // Super+K: Down.
         let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
-        assert_eq!(event, Some(BindingEvent::Down));
+        assert_eq!(event, Some(HotkeyEvent::Down));
         assert!(!swallow);
         // Repeat while held: no new event.
         let (event, _) = m.handle(&repeat(Key::KeyK, Modifiers::SUPER));
@@ -253,7 +253,7 @@ mod tests {
         assert!(event.is_none());
         // K released: Up.
         let (event, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
     fn swallow_flag_only_for_swallow_registration() {
         let mut m = super_k(Suppression::Swallow);
         let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
-        assert_eq!(event, Some(BindingEvent::Down));
+        assert_eq!(event, Some(HotkeyEvent::Down));
         assert!(swallow);
     }
 
@@ -280,14 +280,14 @@ mod tests {
         let mut m = Matcher::new(Hotkey::new(Modifiers::ALT, None), Suppression::Swallow);
         // Alt down (snapshot ALT): Down + swallow.
         let (event, swallow) = m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
-        assert_eq!(event, Some(BindingEvent::Down));
+        assert_eq!(event, Some(HotkeyEvent::Down));
         assert!(swallow);
         // Typing while held: no transition, no swallow (unrelated key).
         let (event, swallow) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::ALT));
         assert!(event.is_none() && !swallow);
         // Alt up: Up.
         let (event, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
         assert!(event.is_none());
         // Fn released (snapshot SHIFT): Up.
         let (event, _) = m.handle(&ev(Key::Function, KeyEventKind::Release, Modifiers::SHIFT));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
     }
 
     #[test]
@@ -317,11 +317,11 @@ mod tests {
         assert!(event.is_none() && !swallow);
         // Right option: Down + swallow.
         let (event, swallow) = m.handle(&ev(Key::AltRight, KeyEventKind::Press, Modifiers::ALT));
-        assert_eq!(event, Some(BindingEvent::Down));
+        assert_eq!(event, Some(HotkeyEvent::Down));
         assert!(swallow);
         // Right released while left still held: Up.
         let (event, _) = m.handle(&ev(Key::AltRight, KeyEventKind::Release, Modifiers::ALT));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let (event, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::SUPER));
         match event {
-            Some(BindingEvent::Up { held_for }) => {
+            Some(HotkeyEvent::Up { held_for }) => {
                 assert!(held_for >= Duration::from_millis(10));
             }
             other => panic!("expected Up, got {other:?}"),
@@ -347,7 +347,7 @@ mod tests {
         // Resumed: matching resumes.
         m.set_enabled(true);
         let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
-        assert_eq!(event, Some(BindingEvent::Down));
+        assert_eq!(event, Some(HotkeyEvent::Down));
         assert!(swallow);
     }
 
@@ -358,7 +358,7 @@ mod tests {
         m.set_enabled(false);
         // The in-flight activation completes on the real release.
         let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
         assert!(!swallow);
     }
 
@@ -373,6 +373,6 @@ mod tests {
         assert!(event.is_none());
         // One hold, one Up.
         let (event, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
-        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
     }
 }

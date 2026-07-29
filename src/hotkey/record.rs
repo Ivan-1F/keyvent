@@ -22,7 +22,20 @@ use std::time::Duration;
 
 use crate::{Guard, Key, KeyEvent, KeyEventKind, Modifiers, Status};
 
-use super::{Hotkey, MATCH_BITS, RecorderEvent, modifier_bit_of};
+use super::{Hotkey, MATCH_BITS, modifier_bit_of};
+
+/// A recording progress or terminal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderEvent {
+    /// The would-be hotkey changed mid-gesture; show it as a live preview.
+    Candidate(Hotkey),
+    /// The gesture finished: every key was released.
+    Recorded(Hotkey),
+    /// Bare Esc was pressed; nothing was recorded.
+    Cancelled,
+    /// Bare Delete was pressed; clear the existing binding.
+    Cleared,
+}
 
 /// Live recording sessions, process-wide. `on` guards pause matching while
 /// this is non-zero.

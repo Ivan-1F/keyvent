@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers, ParseKeyError, ParseModifiersError};
 pub use hotkey::{
-    BindingEvent, Hotkey, HotkeyEvent, HotkeyGuard, HotkeyId, HotkeyManager, HotkeyRecorder,
-    ParseHotkeyError, RecorderEvent, Recording, Suppression, on, record,
+    Hotkey, HotkeyEvent, HotkeyGuard, ParseHotkeyError, RecorderEvent, Recording, Suppression, on,
+    record,
 };
 
 use crate::dispatcher::{BoxedCallback, Dispatcher, DispatcherCommand};

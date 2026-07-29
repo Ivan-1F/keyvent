@@ -22,21 +22,15 @@
 //! also suppresses the system "Press 🌐 key to" action (emoji panel, input
 //! source switch, …).
 
-mod engine;
 mod guard;
-mod manager;
 mod record;
-mod recorder;
 
-pub use guard::{BindingEvent, HotkeyGuard, on};
-pub use manager::HotkeyManager;
-pub use record::{Recording, record};
-pub use recorder::{HotkeyRecorder, RecorderEvent};
+pub use guard::{HotkeyEvent, HotkeyGuard, on};
+pub use record::{RecorderEvent, Recording, record};
 
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use crate::event::parse_modifier_token;
 use crate::{Key, Modifiers};
@@ -198,27 +192,6 @@ pub enum Suppression {
     Swallow,
     /// Events pass through; the hotkey is observed only.
     Pass,
-}
-
-/// Opaque identifier of a registered hotkey.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HotkeyId(u32);
-
-/// A hotkey activation or deactivation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotkeyEvent {
-    /// The hotkey became active.
-    Down(HotkeyId),
-    /// The hotkey became inactive; `held_for` is how long it was active.
-    Up { id: HotkeyId, held_for: Duration },
-}
-
-impl HotkeyEvent {
-    pub fn id(&self) -> HotkeyId {
-        match self {
-            HotkeyEvent::Down(id) | HotkeyEvent::Up { id, .. } => *id,
-        }
-    }
 }
 
 /// Modifier bits relevant for matching.
