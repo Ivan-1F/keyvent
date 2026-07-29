@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers, ParseKeyError, ParseModifiersError};
 pub use hotkey::{
     BindingEvent, Hotkey, HotkeyEvent, HotkeyGuard, HotkeyId, HotkeyManager, HotkeyRecorder,
-    ParseHotkeyError, RecorderEvent, Suppression, on,
+    ParseHotkeyError, RecorderEvent, Recording, Suppression, on, record,
 };
 
 use crate::dispatcher::{BoxedCallback, Dispatcher, DispatcherCommand};

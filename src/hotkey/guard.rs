@@ -12,11 +12,13 @@
 //!   set exactly; Up when the snapshot no longer contains the full set (extra
 //!   modifiers pressed mid-hold do not end it).
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::{Guard, KeyEvent, KeyEventKind, Status};
 
+use super::record::RECORDING;
 use super::{Hotkey, Suppression};
 
 /// A hotkey activation or deactivation.
@@ -43,7 +45,8 @@ enum Command {
     SetEnabled(bool),
 }
 
-/// Register `hotkey`, returning its guard.
+/// Register `hotkey`, returning its guard. Matching is suspended while a
+/// recording is in progress (see [`record`](crate::record)).
 ///
 /// ```no_run
 /// let hotkey: keyvent::Hotkey = "Super+K".parse().unwrap();
@@ -57,13 +60,17 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     let mut matcher = Matcher::new(hotkey, suppression);
+    let mut enabled = true;
     let engine = crate::start(move |event| {
         // Pending pause/resume changes are applied before the match, so they
         // take effect on the very next event — with no locking on the tap
         // thread, per the callback contract.
-        while let Ok(Command::SetEnabled(enabled)) = cmd_rx.try_recv() {
-            matcher.set_enabled(enabled);
+        while let Ok(Command::SetEnabled(user)) = cmd_rx.try_recv() {
+            enabled = user;
         }
+        // Recording sessions pause every on guard; an in-flight activation
+        // still completes on release, per the matcher's enabled semantics.
+        matcher.set_enabled(enabled && RECORDING.load(Ordering::Relaxed) == 0);
         let (binding_event, swallow) = matcher.handle(&event);
         if let Some(e) = binding_event {
             let _ = tx.send(e);

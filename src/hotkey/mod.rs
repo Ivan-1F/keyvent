@@ -25,10 +25,12 @@
 mod engine;
 mod guard;
 mod manager;
+mod record;
 mod recorder;
 
 pub use guard::{BindingEvent, HotkeyGuard, on};
 pub use manager::HotkeyManager;
+pub use record::{Recording, record};
 pub use recorder::{HotkeyRecorder, RecorderEvent};
 
 use std::error::Error;
