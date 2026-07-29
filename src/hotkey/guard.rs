@@ -1,0 +1,371 @@
+//! `HotkeyGuard`: one registered hotkey. The handle is the registration —
+//! activations are received on it directly, and dropping it unregisters.
+//!
+//! The matching state machine (`Matcher`) is pure logic, fully
+//! unit-testable; no user code ever runs on the tap thread.
+//!
+//! Activation semantics (see `docs` on [`Hotkey`]):
+//! - Trigger hotkey: Down when the trigger is pressed with an exact modifier
+//!   match; Up when the trigger is released. Modifier drift mid-hold does not
+//!   end it.
+//! - Modifier-only hotkey: Down when the snapshot first equals the required
+//!   set exactly; Up when the snapshot no longer contains the full set (extra
+//!   modifiers pressed mid-hold do not end it).
+
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use crate::{Guard, KeyEvent, KeyEventKind, Status};
+
+use super::{Hotkey, Suppression};
+
+/// A hotkey activation or deactivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingEvent {
+    /// The hotkey became active.
+    Down,
+    /// The hotkey became inactive; `held_for` is how long it was active.
+    Up { held_for: Duration },
+}
+
+/// A registered hotkey. Receive activations directly on the guard;
+/// dropping the guard unregisters the hotkey.
+///
+/// HotkeyGuards share the process-wide keyvent engine (see [`crate::start`]).
+pub struct HotkeyGuard {
+    commands: mpsc::Sender<Command>,
+    events: mpsc::Receiver<BindingEvent>,
+    engine: Guard,
+}
+
+/// A pause/resume change sent to the matcher on the tap thread.
+enum Command {
+    SetEnabled(bool),
+}
+
+/// Register `hotkey`, returning its guard.
+///
+/// ```no_run
+/// let hotkey: keyvent::Hotkey = "Super+K".parse().unwrap();
+/// let guard = keyvent::on(hotkey, keyvent::Suppression::Swallow);
+/// while let Ok(event) = guard.recv() {
+///     // React to the hotkey here.
+/// }
+/// // Dropping the guard unregisters the hotkey.
+/// ```
+pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let mut matcher = Matcher::new(hotkey, suppression);
+    let engine = crate::start(move |event| {
+        // Pending pause/resume changes are applied before the match, so they
+        // take effect on the very next event — with no locking on the tap
+        // thread, per the callback contract.
+        while let Ok(Command::SetEnabled(enabled)) = cmd_rx.try_recv() {
+            matcher.set_enabled(enabled);
+        }
+        let (binding_event, swallow) = matcher.handle(&event);
+        if let Some(e) = binding_event {
+            let _ = tx.send(e);
+        }
+        swallow
+    });
+    HotkeyGuard {
+        commands: cmd_tx,
+        events: rx,
+        engine,
+    }
+}
+
+impl HotkeyGuard {
+    /// Block until the next activation, `Err` once the engine is gone.
+    pub fn recv(&self) -> Result<BindingEvent, mpsc::RecvError> {
+        self.events.recv()
+    }
+
+    /// The next activation if one is pending.
+    pub fn try_recv(&self) -> Result<BindingEvent, mpsc::TryRecvError> {
+        self.events.try_recv()
+    }
+
+    /// Block up to `timeout` for the next activation.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<BindingEvent, mpsc::RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
+    }
+
+    /// An iterator blocking on each activation.
+    pub fn iter(&self) -> mpsc::Iter<'_, BindingEvent> {
+        self.events.iter()
+    }
+
+    /// An iterator over the pending activations.
+    pub fn try_iter(&self) -> mpsc::TryIter<'_, BindingEvent> {
+        self.events.try_iter()
+    }
+
+    /// Suspend matching: no new activations start and nothing is swallowed.
+    /// An activation already in progress still fires Up when released.
+    pub fn pause(&self) {
+        let _ = self.commands.send(Command::SetEnabled(false));
+    }
+
+    /// Resume matching after [`pause`](Self::pause).
+    pub fn resume(&self) {
+        let _ = self.commands.send(Command::SetEnabled(true));
+    }
+
+    /// Permission lifecycle status of the underlying engine.
+    pub fn status(&self) -> Status {
+        self.engine.status()
+    }
+
+    /// A new subscription to engine status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
+        self.engine.status_receiver()
+    }
+}
+
+/// One registered hotkey's matching state: pure logic, no FFI.
+struct Matcher {
+    hotkey: Hotkey,
+    suppression: Suppression,
+    /// When the hotkey went down, if it is currently active.
+    active: Option<Instant>,
+    /// When false, no new activations start and nothing is swallowed.
+    enabled: bool,
+}
+
+impl Matcher {
+    fn new(hotkey: Hotkey, suppression: Suppression) -> Self {
+        Self {
+            hotkey,
+            suppression,
+            active: None,
+            enabled: true,
+        }
+    }
+
+    /// Suspension stops new activations and all swallowing; an in-flight
+    /// activation still completes on release.
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Process one event. Returns the activation event to emit, if any, and
+    /// whether the raw event should be swallowed.
+    fn handle(&mut self, event: &KeyEvent) -> (Option<BindingEvent>, bool) {
+        let mut binding_event = None;
+        match self.hotkey.key() {
+            Some(trigger) => {
+                if event.key == trigger && !event.is_repeat {
+                    match event.kind {
+                        KeyEventKind::Press if self.enabled && self.active.is_none() => {
+                            if self.hotkey.modifiers_match(event.modifiers) {
+                                self.active = Some(Instant::now());
+                                binding_event = Some(BindingEvent::Down);
+                            }
+                        }
+                        KeyEventKind::Release => binding_event = self.deactivate(),
+                        _ => {}
+                    }
+                }
+            }
+            None => {
+                if self.hotkey.modifiers_match(event.modifiers) {
+                    if self.enabled && self.active.is_none() {
+                        self.active = Some(Instant::now());
+                        binding_event = Some(BindingEvent::Down);
+                    }
+                } else if !event.modifiers.contains(self.hotkey.modifiers()) {
+                    binding_event = self.deactivate();
+                }
+            }
+        }
+
+        // Swallow this raw event if it belongs to an active (or
+        // just-activated) hotkey registered with Suppression::Swallow.
+        // For releases, the raw engine follows the press decision
+        // regardless of what we return here.
+        let swallow = self.enabled
+            && self.suppression == Suppression::Swallow
+            && self.hotkey.involves(event.key)
+            && self.active.is_some();
+        (binding_event, swallow)
+    }
+
+    /// End the activation, emitting Up with the held duration if active.
+    fn deactivate(&mut self) -> Option<BindingEvent> {
+        self.active.take().map(|started| BindingEvent::Up {
+            held_for: started.elapsed(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Key, Modifiers};
+
+    fn ev(key: Key, kind: KeyEventKind, mods: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key,
+            kind,
+            modifiers: mods,
+            is_repeat: false,
+        }
+    }
+
+    fn repeat(key: Key, mods: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key,
+            kind: KeyEventKind::Press,
+            modifiers: mods,
+            is_repeat: true,
+        }
+    }
+
+    fn super_k(suppression: Suppression) -> Matcher {
+        Matcher::new(Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)), suppression)
+    }
+
+    #[test]
+    fn trigger_hotkey_down_up() {
+        let mut m = super_k(Suppression::Pass);
+        // K without Super: nothing.
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::NONE));
+        assert!(event.is_none() && !swallow);
+        // Super+K: Down.
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        assert_eq!(event, Some(BindingEvent::Down));
+        assert!(!swallow);
+        // Repeat while held: no new event.
+        let (event, _) = m.handle(&repeat(Key::KeyK, Modifiers::SUPER));
+        assert!(event.is_none());
+        // Modifier drifts mid-hold (Super released first): still active, no Up.
+        let (event, _) = m.handle(&ev(Key::SuperLeft, KeyEventKind::Release, Modifiers::NONE));
+        assert!(event.is_none());
+        // K released: Up.
+        let (event, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+    }
+
+    #[test]
+    fn exact_match_rejects_extra_modifiers() {
+        let mut m = super_k(Suppression::Pass);
+        let (event, _) = m.handle(&ev(
+            Key::KeyK,
+            KeyEventKind::Press,
+            Modifiers::SUPER | Modifiers::SHIFT,
+        ));
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn swallow_flag_only_for_swallow_registration() {
+        let mut m = super_k(Suppression::Swallow);
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        assert_eq!(event, Some(BindingEvent::Down));
+        assert!(swallow);
+    }
+
+    #[test]
+    fn modifier_only_single_alt() {
+        let mut m = Matcher::new(Hotkey::new(Modifiers::ALT, None), Suppression::Swallow);
+        // Alt down (snapshot ALT): Down + swallow.
+        let (event, swallow) = m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
+        assert_eq!(event, Some(BindingEvent::Down));
+        assert!(swallow);
+        // Typing while held: no transition, no swallow (unrelated key).
+        let (event, swallow) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::ALT));
+        assert!(event.is_none() && !swallow);
+        // Alt up: Up.
+        let (event, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+    }
+
+    #[test]
+    fn modifier_only_survives_extra_modifier_mid_hold() {
+        let mut m = Matcher::new(Hotkey::new(Modifiers::FN, None), Suppression::Pass);
+        m.handle(&ev(Key::Function, KeyEventKind::Press, Modifiers::FN));
+        // Shift pressed mid-hold: set still contains FN, no Up.
+        let (event, _) = m.handle(&ev(
+            Key::ShiftLeft,
+            KeyEventKind::Press,
+            Modifiers::FN | Modifiers::SHIFT,
+        ));
+        assert!(event.is_none());
+        // Fn released (snapshot SHIFT): Up.
+        let (event, _) = m.handle(&ev(Key::Function, KeyEventKind::Release, Modifiers::SHIFT));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+    }
+
+    #[test]
+    fn side_specific_modifier_trigger() {
+        let mut m = Matcher::new(
+            Hotkey::new(Modifiers::NONE, Some(Key::AltRight)),
+            Suppression::Swallow,
+        );
+        // Left option: not this hotkey.
+        let (event, swallow) = m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
+        assert!(event.is_none() && !swallow);
+        // Right option: Down + swallow.
+        let (event, swallow) = m.handle(&ev(Key::AltRight, KeyEventKind::Press, Modifiers::ALT));
+        assert_eq!(event, Some(BindingEvent::Down));
+        assert!(swallow);
+        // Right released while left still held: Up.
+        let (event, _) = m.handle(&ev(Key::AltRight, KeyEventKind::Release, Modifiers::ALT));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+    }
+
+    #[test]
+    fn held_for_is_reported() {
+        let mut m = super_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        std::thread::sleep(Duration::from_millis(10));
+        let (event, _) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::SUPER));
+        match event {
+            Some(BindingEvent::Up { held_for }) => {
+                assert!(held_for >= Duration::from_millis(10));
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paused_emits_nothing_and_swallows_nothing() {
+        let mut m = super_k(Suppression::Swallow);
+        m.set_enabled(false);
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        assert!(event.is_none() && !swallow);
+        // Resumed: matching resumes.
+        m.set_enabled(true);
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        assert_eq!(event, Some(BindingEvent::Down));
+        assert!(swallow);
+    }
+
+    #[test]
+    fn pause_mid_hold_completes_on_release() {
+        let mut m = super_k(Suppression::Pass);
+        m.handle(&ev(Key::KeyK, KeyEventKind::Press, Modifiers::SUPER));
+        m.set_enabled(false);
+        // The in-flight activation completes on the real release.
+        let (event, swallow) = m.handle(&ev(Key::KeyK, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+        assert!(!swallow);
+    }
+
+    #[test]
+    fn modifier_only_held_across_pause_cycle_does_not_refire() {
+        let mut m = Matcher::new(Hotkey::new(Modifiers::ALT, None), Suppression::Pass);
+        m.handle(&ev(Key::AltLeft, KeyEventKind::Press, Modifiers::ALT));
+        m.set_enabled(false);
+        m.set_enabled(true);
+        // Still held from before the cycle: no second Down.
+        let (event, _) = m.handle(&ev(Key::KeyA, KeyEventKind::Press, Modifiers::ALT));
+        assert!(event.is_none());
+        // One hold, one Up.
+        let (event, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
+        assert!(matches!(event, Some(BindingEvent::Up { .. })));
+    }
+}

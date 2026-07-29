@@ -23,9 +23,11 @@
 //! source switch, …).
 
 mod engine;
+mod guard;
 mod manager;
 mod recorder;
 
+pub use guard::{BindingEvent, HotkeyGuard, on};
 pub use manager::HotkeyManager;
 pub use recorder::{HotkeyRecorder, RecorderEvent};
 
