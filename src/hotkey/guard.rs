@@ -1,5 +1,7 @@
-//! `HotkeyGuard`: one registered hotkey. The handle is the registration —
-//! activations are received on it directly, and dropping it unregisters.
+//! `HotkeyEvents`: one registered hotkey and its event stream; dropping it
+//! unregisters. [`HotkeyEvents::guard`] hands out a second handle for
+//! controlling the registration from another thread: dropping the guard
+//! unregisters and closes the stream at once.
 //!
 //! The matching state machine (`Matcher`) is pure logic, fully
 //! unit-testable; no user code ever runs on the tap thread.
@@ -30,14 +32,24 @@ pub enum HotkeyEvent {
     Up { held_for: Duration },
 }
 
-/// A registered hotkey. Receive activations directly on the guard;
-/// dropping the guard unregisters the hotkey.
+/// A registered hotkey and its event stream. Receive activations directly on
+/// it; dropping it unregisters the hotkey.
 ///
-/// HotkeyGuards share the process-wide keyvent engine (see [`crate::start`]).
+/// HotkeyEvents share the process-wide keyvent engine (see [`crate::start`]).
+pub struct HotkeyEvents {
+    rx: mpsc::Receiver<HotkeyEvent>,
+    /// Keeps the registration alive; dropping it unregisters the hotkey.
+    _registration: Guard,
+    pending_guard: Option<HotkeyGuard>,
+    commands: mpsc::Sender<Command>,
+}
+
+/// A registered hotkey's control guard, see [`HotkeyEvents::guard`].
+/// Dropping it unregisters the hotkey.
 pub struct HotkeyGuard {
     commands: mpsc::Sender<Command>,
-    events: mpsc::Receiver<HotkeyEvent>,
-    engine: Guard,
+    /// Its death tells the tap-thread callback to unregister.
+    _cancel: mpsc::Sender<()>,
 }
 
 /// A pause/resume change sent to the matcher on the tap thread.
@@ -45,23 +57,30 @@ enum Command {
     SetEnabled(bool),
 }
 
-/// Register `hotkey`, returning its guard. Matching is suspended while a
-/// recording is in progress (see [`record`](crate::record)).
+/// Register `hotkey`, returning its event stream. Matching is suspended
+/// while a recording is in progress (see [`record`](crate::record)).
 ///
 /// ```no_run
 /// let hotkey: keyvent::Hotkey = "Super+K".parse().unwrap();
-/// let guard = keyvent::on(hotkey, keyvent::Suppression::Swallow);
-/// while let Ok(event) = guard.recv() {
-///     // React to the hotkey here.
+/// let events = keyvent::on(hotkey, keyvent::Suppression::Swallow);
+/// while let Ok(event) = events.recv() {
+///     // HotkeyEvent::Down / HotkeyEvent::Up { held_for }
 /// }
-/// // Dropping the guard unregisters the hotkey.
+/// // Dropping `events` unregisters the hotkey.
 /// ```
-pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
+pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
     let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
+    let mut tx = Some(tx);
     let mut matcher = Matcher::new(hotkey, suppression);
     let mut enabled = true;
-    let engine = crate::start(move |event| {
+    let registration = crate::start(move |event| {
+        // The guard is gone: unregister — close the channel, stop matching.
+        if matches!(cancel_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+            tx = None;
+            return false;
+        }
         // Pending pause/resume changes are applied before the match, so they
         // take effect on the very next event — with no locking on the tap
         // thread, per the callback contract.
@@ -73,41 +92,53 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyGuard {
         matcher.set_enabled(enabled && RECORDING.load(Ordering::Relaxed) == 0);
         let (hotkey_event, swallow) = matcher.handle(&event);
         if let Some(e) = hotkey_event {
-            let _ = tx.send(e);
+            if let Some(sender) = &tx {
+                let _ = sender.send(e);
+            }
         }
         swallow
     });
-    HotkeyGuard {
+    HotkeyEvents {
+        rx,
+        _registration: registration,
+        pending_guard: Some(HotkeyGuard {
+            commands: cmd_tx.clone(),
+            _cancel: cancel_tx,
+        }),
         commands: cmd_tx,
-        events: rx,
-        engine,
     }
 }
 
-impl HotkeyGuard {
-    /// Block until the next activation, `Err` once the engine is gone.
+impl HotkeyEvents {
+    /// Take this registration's control guard (at most once). Dropping the
+    /// guard unregisters the hotkey and closes the event channel at once.
+    pub fn guard(&mut self) -> Option<HotkeyGuard> {
+        self.pending_guard.take()
+    }
+
+    /// Block until the next activation, `Err` once the channel is closed.
     pub fn recv(&self) -> Result<HotkeyEvent, mpsc::RecvError> {
-        self.events.recv()
+        self.rx.recv()
     }
 
     /// The next activation if one is pending.
     pub fn try_recv(&self) -> Result<HotkeyEvent, mpsc::TryRecvError> {
-        self.events.try_recv()
+        self.rx.try_recv()
     }
 
     /// Block up to `timeout` for the next activation.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<HotkeyEvent, mpsc::RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
+        self.rx.recv_timeout(timeout)
     }
 
     /// An iterator blocking on each activation.
     pub fn iter(&self) -> mpsc::Iter<'_, HotkeyEvent> {
-        self.events.iter()
+        self.rx.iter()
     }
 
     /// An iterator over the pending activations.
     pub fn try_iter(&self) -> mpsc::TryIter<'_, HotkeyEvent> {
-        self.events.try_iter()
+        self.rx.try_iter()
     }
 
     /// Suspend matching: no new activations start and nothing is swallowed.
@@ -123,12 +154,25 @@ impl HotkeyGuard {
 
     /// Permission lifecycle status of the underlying engine.
     pub fn status(&self) -> Status {
-        self.engine.status()
+        self._registration.status()
     }
 
     /// A new subscription to engine status changes.
     pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
-        self.engine.status_receiver()
+        self._registration.status_receiver()
+    }
+}
+
+impl HotkeyGuard {
+    /// Suspend matching: no new activations start and nothing is swallowed.
+    /// An activation already in progress still fires Up when released.
+    pub fn pause(&self) {
+        let _ = self.commands.send(Command::SetEnabled(false));
+    }
+
+    /// Resume matching after [`pause`](Self::pause).
+    pub fn resume(&self) {
+        let _ = self.commands.send(Command::SetEnabled(true));
     }
 }
 

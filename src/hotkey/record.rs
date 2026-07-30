@@ -1,5 +1,6 @@
-//! `Recording`: one hotkey recording session. The handle is the session —
-//! events are received on it directly, and dropping it cancels.
+//! `Recording`: one hotkey recording session. Dropping the recording cancels
+//! the session; the event stream also ends on its own when the gesture
+//! resolves.
 //!
 //! Gesture semantics:
 //! - The candidate is the modifier set plus the last non-modifier key
@@ -41,40 +42,51 @@ pub enum RecorderEvent {
 /// this is non-zero.
 pub(crate) static RECORDING: AtomicUsize = AtomicUsize::new(0);
 
-/// A hotkey recording session. Receive events directly on it; dropping it
-/// cancels the recording. The session also ends on its own when a terminal
-/// event (`Recorded`, `Cancelled`, `Cleared`) is produced: the channel then
-/// closes (`recv` returns `Err`, iterators end), and dropping is a no-op.
-///
-/// Recordings share the process-wide keyvent engine (see [`crate::start`]).
+/// A hotkey recording session's control guard, see
+/// [`RecorderEvents::guard`]. Dropping it cancels the recording.
 pub struct Recording {
-    events: mpsc::Receiver<RecorderEvent>,
-    engine: Guard,
+    /// Its death tells the tap-thread callback to cancel the session.
+    _cancel: mpsc::Sender<()>,
 }
 
-/// Record a hotkey from the user's next keystrokes.
+/// Record a hotkey from the user's next keystrokes, returning the event
+/// stream.
 ///
 /// ```no_run
-/// let recording = keyvent::record();
-/// for event in recording.iter() {
+/// let events = keyvent::record();
+/// while let Ok(event) = events.recv() {
 ///     // Live candidates, then one terminal event — after which the
-///     // iterator ends on its own.
+///     // channel closes and the loop ends.
 /// }
-/// // Dropping an unfinished recording cancels it.
+/// // Dropping `events` cancels the recording.
 /// ```
-pub fn record() -> Recording {
+pub fn record() -> RecorderEvents {
+    let (cancel_tx, cancel_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     let mut tx = Some(tx);
     let mut gesture = Gesture::new();
     let mut pause = Some(RecordingPause::new());
-    let engine = crate::start(move |event| {
-        // A finished session has closed its channel; pass events through.
-        let Some(sender) = &tx else { return false };
+    let mut finished = false;
+    let registration = crate::start(move |event| {
+        // The guard is gone: cancel the session — release every on guard
+        // and close the channel.
+        if matches!(cancel_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+            drop(pause.take());
+            tx = None;
+            return false;
+        }
+        // A finished session passes events through.
+        if finished {
+            return false;
+        }
         let step = gesture.handle(&event);
-        for e in &step.events {
-            let _ = sender.send(*e);
+        if let Some(sender) = &tx {
+            for e in &step.events {
+                let _ = sender.send(*e);
+            }
         }
         if step.finished {
+            finished = true;
             // Closing the channel ends the receiver's loop after the
             // terminal event — a recording, unlike a binding, has an end.
             tx = None;
@@ -83,43 +95,63 @@ pub fn record() -> Recording {
         }
         step.swallow
     });
-    Recording { events: rx, engine }
+    RecorderEvents {
+        rx,
+        _registration: registration,
+        pending_guard: Some(Recording { _cancel: cancel_tx }),
+    }
 }
 
-impl Recording {
-    /// Block until the next event, `Err` once the session has ended.
+/// The event stream of a recording session. The stream ends after the
+/// terminal event (`Recorded`, `Cancelled`, `Cleared`) is yielded, or when
+/// the recording is cancelled. Dropping it cancels the recording.
+pub struct RecorderEvents {
+    rx: mpsc::Receiver<RecorderEvent>,
+    /// Keeps the registration alive; dropping it cancels the recording.
+    _registration: Guard,
+    pending_guard: Option<Recording>,
+}
+
+impl RecorderEvents {
+    /// Take this session's control guard (at most once). Dropping the guard
+    /// cancels the recording.
+    pub fn guard(&mut self) -> Option<Recording> {
+        self.pending_guard.take()
+    }
+
+    /// Block until the next event, `Err` once the channel is closed.
     pub fn recv(&self) -> Result<RecorderEvent, mpsc::RecvError> {
-        self.events.recv()
+        self.rx.recv()
     }
 
     /// The next event if one is pending.
     pub fn try_recv(&self) -> Result<RecorderEvent, mpsc::TryRecvError> {
-        self.events.try_recv()
+        self.rx.try_recv()
     }
 
     /// Block up to `timeout` for the next event.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<RecorderEvent, mpsc::RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
+        self.rx.recv_timeout(timeout)
     }
 
     /// An iterator blocking on each event.
     pub fn iter(&self) -> mpsc::Iter<'_, RecorderEvent> {
-        self.events.iter()
+        self.rx.iter()
     }
 
     /// An iterator over the pending events.
     pub fn try_iter(&self) -> mpsc::TryIter<'_, RecorderEvent> {
-        self.events.try_iter()
+        self.rx.try_iter()
     }
 
     /// Permission lifecycle status of the underlying engine.
     pub fn status(&self) -> Status {
-        self.engine.status()
+        self._registration.status()
     }
 
     /// A new subscription to engine status changes.
     pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
-        self.engine.status_receiver()
+        self._registration.status_receiver()
     }
 }
 

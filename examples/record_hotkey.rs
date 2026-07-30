@@ -10,40 +10,42 @@ use std::io::{self, Write};
 use keyvent::{Hotkey, HotkeyEvent, Key, Modifiers, RecorderEvent, Status, Suppression};
 
 fn main() {
-    let recording = keyvent::record();
-    if recording.status() != Status::Running {
+    let recorder_events = keyvent::record();
+    if recorder_events.status() != Status::Running {
         println!("Waiting for Accessibility permission…");
     }
     println!("Record a hotkey (Esc cancels, Delete clears).");
 
     let hotkey = loop {
-        match recording.recv().unwrap() {
+        match recorder_events.recv() {
             // Live preview while the gesture builds.
-            RecorderEvent::Candidate(h) => {
+            Ok(RecorderEvent::Candidate(h)) => {
                 print!("\r\x1b[K> {hotkey}", hotkey = show(h));
                 io::stdout().flush().unwrap();
             }
-            RecorderEvent::Recorded(h) => {
+            Ok(RecorderEvent::Recorded(h)) => {
                 println!("\r\x1b[KRecorded: {hotkey}", hotkey = show(h));
                 break h;
             }
-            RecorderEvent::Cancelled => {
+            Ok(RecorderEvent::Cancelled) => {
                 println!("\r\x1b[KCancelled.");
                 return;
             }
-            RecorderEvent::Cleared => {
+            Ok(RecorderEvent::Cleared) => {
                 println!("\r\x1b[KCleared.");
                 return;
             }
+            // The recording was dropped or the engine is gone.
+            Err(_) => return,
         }
     };
 
-    let guard = keyvent::on(hotkey, Suppression::Swallow);
+    let events = keyvent::on(hotkey, Suppression::Swallow);
     println!(
         "Registered. Press {hotkey} anywhere (Ctrl+C quits).",
         hotkey = show(hotkey)
     );
-    while let Ok(event) = guard.recv() {
+    while let Ok(event) = events.recv() {
         match event {
             HotkeyEvent::Down => println!("down"),
             HotkeyEvent::Up { held_for } => println!("up, held for {held_for:.2?}"),
