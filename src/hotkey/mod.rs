@@ -26,7 +26,7 @@ mod guard;
 mod record;
 
 pub use guard::{HotkeyEvent, HotkeyEvents, HotkeyGuard, on};
-pub use record::{RecorderEvent, RecorderEvents, Recording, record};
+pub use record::{RecordOutcome, RecorderEvent, RecorderEvents, Recording, record};
 
 use std::error::Error;
 use std::fmt;

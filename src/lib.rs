@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 
 pub use event::{Key, KeyEvent, KeyEventKind, Modifiers, ParseKeyError, ParseModifiersError};
 pub use hotkey::{
-    Hotkey, HotkeyEvent, HotkeyEvents, HotkeyGuard, ParseHotkeyError, RecorderEvent,
+    Hotkey, HotkeyEvent, HotkeyEvents, HotkeyGuard, ParseHotkeyError, RecordOutcome, RecorderEvent,
     RecorderEvents, Recording, Suppression, on, record,
 };
 

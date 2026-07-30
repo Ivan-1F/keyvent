@@ -11,8 +11,7 @@
 //!   (`{NONE, AltRight}`), several record the peak modifier set
 //!   (`{SUPER|SHIFT, None}`) — pressing both sides of a modifier is how the
 //!   side-agnostic group (`{ALT, None}`) is recorded.
-//! - Bare Esc cancels and bare Delete clears; with modifiers held, both are
-//!   ordinary recordable keys.
+//! - Bare Esc cancels; every other key is recordable, including bare Delete.
 //! - All keyboard input is swallowed while recording, and every `on` guard
 //!   pauses matching; both end when the session ends.
 
@@ -30,12 +29,17 @@ use super::{Hotkey, MATCH_BITS, modifier_bit_of};
 pub enum RecorderEvent {
     /// The would-be hotkey changed mid-gesture; show it as a live preview.
     Candidate(Hotkey),
-    /// The gesture finished: every key was released.
+    /// The gesture resolved.
+    Finished(RecordOutcome),
+}
+
+/// How a recording gesture resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// The gesture finished: every key was released; this is the hotkey.
     Recorded(Hotkey),
     /// Bare Esc was pressed; nothing was recorded.
     Cancelled,
-    /// Bare Delete was pressed; clear the existing binding.
-    Cleared,
 }
 
 /// Live recording sessions, process-wide. `on` guards pause matching while
@@ -56,7 +60,7 @@ pub struct Recording {
 /// ```no_run
 /// let events = keyvent::record();
 /// while let Ok(event) = events.recv() {
-///     // Live candidates, then one terminal event — after which the
+///     // Live candidates, then one `Finished` event — after which the
 ///     // channel closes and the loop ends.
 /// }
 /// // Dropping `events` cancels the recording.
@@ -104,8 +108,8 @@ pub fn record() -> RecorderEvents {
 }
 
 /// The event stream of a recording session. The stream ends after the
-/// terminal event (`Recorded`, `Cancelled`, `Cleared`) is yielded, or when
-/// the recording is cancelled. Dropping it cancels the recording.
+/// `Finished` event is yielded, or when the recording is cancelled.
+/// Dropping it cancels the recording.
 pub struct RecorderEvents {
     rx: mpsc::Receiver<RecorderEvent>,
     /// Keeps the registration alive; dropping it cancels the recording.
@@ -211,11 +215,10 @@ impl Gesture {
         let mods = event.modifiers & MATCH_BITS;
         match event.kind {
             KeyEventKind::Press if !event.is_repeat => {
+                // Bare Esc cancels; every other key is recordable.
                 if mods.is_empty() && event.key == Key::Escape {
-                    step.events.push(RecorderEvent::Cancelled);
-                    step.finished = true;
-                } else if mods.is_empty() && event.key == Key::Delete {
-                    step.events.push(RecorderEvent::Cleared);
+                    step.events
+                        .push(RecorderEvent::Finished(RecordOutcome::Cancelled));
                     step.finished = true;
                 } else {
                     self.held.insert(event.key);
@@ -238,7 +241,9 @@ impl Gesture {
                     && (self.trigger.is_some() || !self.peak.is_empty())
                 {
                     step.events
-                        .push(RecorderEvent::Recorded(self.candidate_hotkey()));
+                        .push(RecorderEvent::Finished(RecordOutcome::Recorded(
+                            self.candidate_hotkey(),
+                        )));
                     step.finished = true;
                 }
             }
@@ -315,6 +320,10 @@ mod tests {
         assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
     }
 
+    fn recorded(hotkey: Hotkey) -> RecorderEvent {
+        RecorderEvent::Finished(RecordOutcome::Recorded(hotkey))
+    }
+
     #[test]
     fn bare_key_records_on_release() {
         let mut g = Gesture::new();
@@ -330,10 +339,7 @@ mod tests {
         let step = g.handle(&release(Key::KeyK, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::NONE,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::NONE, Some(Key::KeyK)))]
         );
         assert!(step.swallow && step.finished);
     }
@@ -365,10 +371,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::SUPER,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)))]
         );
         assert!(step.finished);
     }
@@ -394,10 +397,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::SUPER,
-                Some(Key::KeyJ)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::SUPER, Some(Key::KeyJ)))]
         );
     }
 
@@ -411,10 +411,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::NONE,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::NONE, Some(Key::KeyK)))]
         );
     }
 
@@ -436,7 +433,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
+            vec![recorded(Hotkey::new(
                 Modifiers::SUPER | Modifiers::SHIFT,
                 None
             ))]
@@ -459,10 +456,7 @@ mod tests {
         let step = g.handle(&release(Key::AltRight, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::NONE,
-                Some(Key::AltRight)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::NONE, Some(Key::AltRight)))]
         );
     }
 
@@ -481,7 +475,7 @@ mod tests {
         let step = g.handle(&release(Key::AltRight, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(Modifiers::ALT, None))]
+            vec![recorded(Hotkey::new(Modifiers::ALT, None))]
         );
     }
 
@@ -495,7 +489,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
+            vec![recorded(Hotkey::new(
                 Modifiers::SUPER | Modifiers::SHIFT,
                 None
             ))]
@@ -509,7 +503,7 @@ mod tests {
         let step = g.handle(&release(Key::Function, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(Modifiers::FN, None))]
+            vec![recorded(Hotkey::new(Modifiers::FN, None))]
         );
 
         let mut g = Gesture::new();
@@ -519,10 +513,7 @@ mod tests {
         let step = g.handle(&release(Key::Function, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::FN,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::FN, Some(Key::KeyK)))]
         );
     }
 
@@ -533,10 +524,7 @@ mod tests {
         let step = g.handle(&release(Key::CapsLock, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::NONE,
-                Some(Key::CapsLock)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::NONE, Some(Key::CapsLock)))]
         );
     }
 
@@ -544,7 +532,10 @@ mod tests {
     fn bare_esc_cancels() {
         let mut g = Gesture::new();
         let step = g.handle(&press(Key::Escape, Modifiers::NONE));
-        assert_eq!(step.events, vec![RecorderEvent::Cancelled]);
+        assert_eq!(
+            step.events,
+            vec![RecorderEvent::Finished(RecordOutcome::Cancelled)]
+        );
         assert!(step.swallow && step.finished);
     }
 
@@ -557,19 +548,29 @@ mod tests {
         let step = g.handle(&release(Key::ControlLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::CONTROL,
-                Some(Key::Escape)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::CONTROL, Some(Key::Escape)))]
         );
     }
 
     #[test]
-    fn bare_delete_clears() {
+    fn bare_delete_records() {
         let mut g = Gesture::new();
+        // Bare Delete is an ordinary recordable key.
         let step = g.handle(&press(Key::Delete, Modifiers::NONE));
-        assert_eq!(step.events, vec![RecorderEvent::Cleared]);
-        assert!(step.swallow && step.finished);
+        assert_eq!(
+            step.events,
+            vec![RecorderEvent::Candidate(Hotkey::new(
+                Modifiers::NONE,
+                Some(Key::Delete)
+            ))]
+        );
+        assert!(step.swallow && !step.finished);
+        let step = g.handle(&release(Key::Delete, Modifiers::NONE));
+        assert_eq!(
+            step.events,
+            vec![recorded(Hotkey::new(Modifiers::NONE, Some(Key::Delete)))]
+        );
+        assert!(step.finished);
     }
 
     #[test]
@@ -584,10 +585,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::SUPER,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)))]
         );
     }
 
@@ -621,10 +619,7 @@ mod tests {
         let step = g.handle(&release(Key::SuperLeft, Modifiers::NONE));
         assert_eq!(
             step.events,
-            vec![RecorderEvent::Recorded(Hotkey::new(
-                Modifiers::SUPER,
-                Some(Key::KeyK)
-            ))]
+            vec![recorded(Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)))]
         );
     }
 }

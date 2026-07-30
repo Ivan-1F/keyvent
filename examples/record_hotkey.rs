@@ -7,7 +7,9 @@
 
 use std::io::{self, Write};
 
-use keyvent::{Hotkey, HotkeyEvent, Key, Modifiers, RecorderEvent, Status, Suppression};
+use keyvent::{
+    Hotkey, HotkeyEvent, Key, Modifiers, RecordOutcome, RecorderEvent, Status, Suppression,
+};
 
 fn main() {
     let recorder_events = keyvent::record();
@@ -23,18 +25,22 @@ fn main() {
                 print!("\r\x1b[K> {hotkey}", hotkey = show(h));
                 io::stdout().flush().unwrap();
             }
-            Ok(RecorderEvent::Recorded(h)) => {
-                println!("\r\x1b[KRecorded: {hotkey}", hotkey = show(h));
-                break h;
-            }
-            Ok(RecorderEvent::Cancelled) => {
-                println!("\r\x1b[KCancelled.");
-                return;
-            }
-            Ok(RecorderEvent::Cleared) => {
-                println!("\r\x1b[KCleared.");
-                return;
-            }
+            Ok(RecorderEvent::Finished(outcome)) => match outcome {
+                RecordOutcome::Recorded(h) => {
+                    // An app-level convention, not a library feature:
+                    // recording bare Delete clears the binding.
+                    if h == Hotkey::new(Modifiers::NONE, Some(Key::Delete)) {
+                        println!("\r\x1b[KCleared.");
+                        return;
+                    }
+                    println!("\r\x1b[KRecorded: {hotkey}", hotkey = show(h));
+                    break h;
+                }
+                RecordOutcome::Cancelled => {
+                    println!("\r\x1b[KCancelled.");
+                    return;
+                }
+            },
             // The recording was dropped or the engine is gone.
             Err(_) => return,
         }
