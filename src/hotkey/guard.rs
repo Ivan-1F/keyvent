@@ -13,10 +13,12 @@
 //!   set exactly; Up when the snapshot no longer contains the full set (extra
 //!   modifiers pressed mid-hold do not end it).
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::status::StatusBroadcast;
 use crate::{Guard, KeyEvent, KeyEventKind, Status};
 
 use super::record::RECORDING;
@@ -47,6 +49,7 @@ pub struct HotkeyEvents {
 /// Dropping it unregisters the hotkey; the event channel closes at the
 /// next keyboard event.
 pub struct HotkeyGuard {
+    status: Arc<StatusBroadcast>,
     commands: mpsc::Sender<Command>,
     /// Its death tells the tap-thread callback to unregister.
     _cancel: mpsc::Sender<()>,
@@ -98,10 +101,12 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
         }
         swallow
     });
+    let status = registration.status_broadcast();
     HotkeyEvents {
         rx,
         _registration: registration,
         pending_guard: Some(HotkeyGuard {
+            status,
             commands: cmd_tx.clone(),
             _cancel: cancel_tx,
         }),
@@ -172,6 +177,16 @@ impl HotkeyGuard {
     /// Resume matching after [`pause`](Self::pause).
     pub fn resume(&self) {
         let _ = self.commands.send(Command::SetEnabled(true));
+    }
+
+    /// Permission lifecycle status of the underlying engine.
+    pub fn status(&self) -> Status {
+        self.status.current()
+    }
+
+    /// A new subscription to engine status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
+        self.status.subscribe()
     }
 }
 

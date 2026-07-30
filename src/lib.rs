@@ -224,6 +224,12 @@ impl Guard {
     pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
         self.engine.broadcast.subscribe()
     }
+
+    /// The engine's status broadcast, for secondary handles of one
+    /// registration.
+    pub(crate) fn status_broadcast(&self) -> Arc<StatusBroadcast> {
+        self.engine.broadcast.clone()
+    }
 }
 
 #[cfg(test)]

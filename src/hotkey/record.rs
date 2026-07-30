@@ -16,10 +16,12 @@
 //!   pauses matching; both end when the session ends.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::status::StatusBroadcast;
 use crate::{Guard, Key, KeyEvent, KeyEventKind, Modifiers, Status};
 
 use super::{Hotkey, MATCH_BITS, modifier_bit_of};
@@ -50,6 +52,7 @@ pub(crate) static RECORDING: AtomicUsize = AtomicUsize::new(0);
 /// [`RecorderEvents::guard`]. Dropping it cancels the recording; the event
 /// channel closes at the next keyboard event.
 pub struct Recording {
+    status: Arc<StatusBroadcast>,
     /// Its death tells the tap-thread callback to cancel the session.
     _cancel: mpsc::Sender<()>,
 }
@@ -100,10 +103,26 @@ pub fn record() -> RecorderEvents {
         }
         step.swallow
     });
+    let status = registration.status_broadcast();
     RecorderEvents {
         rx,
         _registration: registration,
-        pending_guard: Some(Recording { _cancel: cancel_tx }),
+        pending_guard: Some(Recording {
+            status,
+            _cancel: cancel_tx,
+        }),
+    }
+}
+
+impl Recording {
+    /// Permission lifecycle status of the underlying engine.
+    pub fn status(&self) -> Status {
+        self.status.current()
+    }
+
+    /// A new subscription to engine status changes.
+    pub fn status_receiver(&self) -> mpsc::Receiver<Status> {
+        self.status.subscribe()
     }
 }
 
