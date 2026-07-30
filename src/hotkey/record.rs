@@ -1,6 +1,6 @@
-//! `Recording`: one hotkey recording session. Dropping the recording cancels
-//! the session; the event stream also ends on its own when the gesture
-//! resolves.
+//! `RecorderEvents`: one hotkey recording session and its event stream.
+//! Dropping it cancels the session; the stream also ends on its own when
+//! the gesture resolves.
 //!
 //! Gesture semantics:
 //! - The candidate is the modifier set plus the last non-modifier key
@@ -43,7 +43,8 @@ pub enum RecorderEvent {
 pub(crate) static RECORDING: AtomicUsize = AtomicUsize::new(0);
 
 /// A hotkey recording session's control guard, see
-/// [`RecorderEvents::guard`]. Dropping it cancels the recording.
+/// [`RecorderEvents::guard`]. Dropping it cancels the recording; the event
+/// channel closes at the next keyboard event.
 pub struct Recording {
     /// Its death tells the tap-thread callback to cancel the session.
     _cancel: mpsc::Sender<()>,
@@ -113,8 +114,7 @@ pub struct RecorderEvents {
 }
 
 impl RecorderEvents {
-    /// Take this session's control guard (at most once). Dropping the guard
-    /// cancels the recording.
+    /// Take this session's control guard (at most once).
     pub fn guard(&mut self) -> Option<Recording> {
         self.pending_guard.take()
     }

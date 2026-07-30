@@ -1,7 +1,6 @@
 //! `HotkeyEvents`: one registered hotkey and its event stream; dropping it
 //! unregisters. [`HotkeyEvents::guard`] hands out a second handle for
-//! controlling the registration from another thread: dropping the guard
-//! unregisters and closes the stream at once.
+//! controlling the registration from another thread.
 //!
 //! The matching state machine (`Matcher`) is pure logic, fully
 //! unit-testable; no user code ever runs on the tap thread.
@@ -45,7 +44,8 @@ pub struct HotkeyEvents {
 }
 
 /// A registered hotkey's control guard, see [`HotkeyEvents::guard`].
-/// Dropping it unregisters the hotkey.
+/// Dropping it unregisters the hotkey; the event channel closes at the
+/// next keyboard event.
 pub struct HotkeyGuard {
     commands: mpsc::Sender<Command>,
     /// Its death tells the tap-thread callback to unregister.
@@ -110,8 +110,7 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
 }
 
 impl HotkeyEvents {
-    /// Take this registration's control guard (at most once). Dropping the
-    /// guard unregisters the hotkey and closes the event channel at once.
+    /// Take this registration's control guard (at most once).
     pub fn guard(&mut self) -> Option<HotkeyGuard> {
         self.pending_guard.take()
     }
