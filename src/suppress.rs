@@ -29,6 +29,9 @@ use crate::platform::Keycode;
 pub(crate) const FN_KEYCODE: Keycode = 63;
 /// Keycode of the synthesized event macOS emits on Fn release to trigger the
 /// system "Press 🌐 key to" action (emoji panel, input-source switch, …).
+/// It TRAILS the Fn-release FlagsChanged in the event stream, so by the time
+/// it arrives the Fn press bookkeeping is already closed; the swallowed
+/// cycle's decision is carried forward by `globe_armed`.
 #[cfg(target_os = "macos")]
 pub(crate) const GLOBE_ACTION_KEYCODE: Keycode = 179;
 
@@ -46,11 +49,25 @@ pub(crate) struct Suppression {
     /// Keycodes whose initial press was swallowed and whose release is still
     /// pending. Only initial presses create entries — never repeats.
     swallowed_presses: HashSet<Keycode>,
+    /// Set when a swallowed Fn release closes its cycle: the globe-action
+    /// pair (keycode 179) trails the release, after the press bookkeeping
+    /// has already closed, so this bit carries the cycle's swallow decision
+    /// forward to it. Cleared by ANY observed Fn event — the pair is
+    /// attributed to the swallowed cycle iff no Fn event has been observed
+    /// since, so stale attribution across a stream gap (tap-down, secure-
+    /// input bypass, …) is impossible without enumerating gap kinds.
+    #[cfg(target_os = "macos")]
+    globe_armed: bool,
 }
 
 impl Suppression {
     /// Book a press. `user_swallow` is the callback's decision.
     pub(crate) fn press(&mut self, code: Keycode, is_repeat: bool, user_swallow: bool) -> Action {
+        #[cfg(target_os = "macos")]
+        if code == FN_KEYCODE {
+            // A new Fn press invalidates any trailing globe attribution.
+            self.globe_armed = false;
+        }
         if self.swallowed_presses.contains(&code) {
             // Mid-cycle of a swallowed press: everything (repeats, re-press
             // after a lost release) stays swallowed.
@@ -77,7 +94,15 @@ impl Suppression {
     /// swallowed press -> forced swallow; anything else -> forced pass, so a
     /// passed press can never leave the OS with a stuck key.
     pub(crate) fn release(&mut self, code: Keycode) -> Action {
-        if self.swallowed_presses.remove(&code) {
+        let tracked = self.swallowed_presses.remove(&code);
+        #[cfg(target_os = "macos")]
+        if code == FN_KEYCODE {
+            // A swallowed release arms the trailing globe action; a release
+            // whose press went unobserved (stream gap) disarms it — fail
+            // open for a cycle we never claimed.
+            self.globe_armed = tracked;
+        }
+        if tracked {
             Action::Swallow
         } else {
             Action::Pass
@@ -102,10 +127,13 @@ impl Suppression {
     }
 
     /// True if `code` is the globe-action event and the Fn cycle that
-    /// produced it is being swallowed.
+    /// produced it is being swallowed: either mid-cycle (Fn press still
+    /// booked, e.g. double-press dictation) or trailing a swallowed Fn
+    /// release with no Fn event observed since.
     #[cfg(target_os = "macos")]
     pub(crate) fn swallows_globe_action(&self, code: Keycode) -> bool {
-        code == GLOBE_ACTION_KEYCODE && self.swallowed_presses.contains(&FN_KEYCODE)
+        code == GLOBE_ACTION_KEYCODE
+            && (self.swallowed_presses.contains(&FN_KEYCODE) || self.globe_armed)
     }
 
     #[cfg(test)]
@@ -158,19 +186,53 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn globe_action_follows_fn_swallow() {
+    fn globe_action_trailing_fn_release_is_swallowed() {
         let mut s = Suppression::default();
         // Fn cycle not claimed: the globe-action event passes.
         assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
-        // Fn press swallowed: the whole cycle — Fn release AND the
-        // globe-action event — is suppressed.
+        // Swallowed Fn cycle: press and release are both swallowed...
         assert_eq!(s.press(FN_KEYCODE, false, true), Action::Swallow);
+        // ...mid-cycle synthesis (double-press dictation) is swallowed too.
         assert!(s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
-        // After the Fn release is booked, the cycle is over.
         assert_eq!(s.release(FN_KEYCODE), Action::Swallow);
-        assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
+        // The globe action TRAILS the Fn release: with no Fn event observed
+        // since, the pair that follows is still swallowed.
+        assert!(s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
         // Unrelated keycodes are never globe actions.
         assert!(!s.swallows_globe_action(36));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn new_fn_cycle_invalidates_stale_attribution() {
+        let mut s = Suppression::default();
+        // A swallowed Fn CHORD attributes the next 179 to it, but no globe
+        // action follows (Fn was used as a modifier, not tapped alone).
+        assert_eq!(s.press(FN_KEYCODE, false, true), Action::Swallow);
+        assert_eq!(s.release(FN_KEYCODE), Action::Swallow);
+        // The next Fn cycle passes unswallowed; its events invalidate the
+        // stale attribution, so this cycle's globe action reaches the system.
+        assert_eq!(s.press(FN_KEYCODE, false, false), Action::Pass);
+        assert_eq!(s.release(FN_KEYCODE), Action::Pass);
+        assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn unobserved_fn_press_invalidates_stale_attribution() {
+        let mut s = Suppression::default();
+        // A swallowed Fn CHORD leaves an armed attribution.
+        assert_eq!(s.press(FN_KEYCODE, false, true), Action::Swallow);
+        assert_eq!(s.release(FN_KEYCODE), Action::Swallow);
+        // Stream gap — with rebuild (tap-down) or without (secure-input
+        // bypass): the next Fn press goes unobserved, and its release
+        // arrives untracked. (A rebuild also reconciles; reconcile does not
+        // touch the attribution — the untracked release alone invalidates
+        // it, whichever gap kind occurred.)
+        let _ = s.reconcile(|_| false);
+        assert_eq!(s.release(FN_KEYCODE), Action::Pass);
+        // Fail open: the unclaimed cycle's globe action reaches the system.
+        assert!(!s.swallows_globe_action(GLOBE_ACTION_KEYCODE));
     }
 
     #[test]
