@@ -151,6 +151,11 @@ fn supervise(
         std::thread::sleep(TICK);
         let now = Instant::now();
 
+        // Poll secure input on this thread only (IsSecureEventInputEnabled is
+        // documented "Not thread safe" in the SDK) and publish it for the tap
+        // thread, which gates heartbeat injection on it.
+        shared.set_secure_input(secure_input_active());
+
         // Periodic probe; entering Suspicion forces it sooner.
         let mut probed: Option<bool> = None;
         if now >= probe_due {

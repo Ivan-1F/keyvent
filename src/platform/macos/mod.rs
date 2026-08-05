@@ -70,6 +70,11 @@ pub(crate) struct TapShared {
     /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on
     /// this.
     user_input_disabled: AtomicBool,
+    /// Secure input (password field / lock screen) is active, polled by the
+    /// supervisor thread. While set, the tap thread must not inject heartbeat
+    /// events: taps receive nothing in this state, so an injected event would
+    /// land unsuppressed in the password field as a typed character.
+    secure_input: AtomicBool,
 }
 
 struct TapHandle(CFRetained<CFMachPort>);
@@ -87,7 +92,18 @@ impl TapShared {
             hb_acked: AtomicU32::new(0),
             timeouts: AtomicU32::new(0),
             user_input_disabled: AtomicBool::new(false),
+            secure_input: AtomicBool::new(false),
         }
+    }
+
+    /// Supervisor thread only: publish the latest secure-input state.
+    pub(crate) fn set_secure_input(&self, active: bool) {
+        self.secure_input.store(active, SeqCst);
+    }
+
+    /// True while secure input is active (heartbeat injection forbidden).
+    pub(crate) fn secure_input(&self) -> bool {
+        self.secure_input.load(SeqCst)
     }
 
     /// Force-invalidate the live tap from any thread. Returns true if a tap was
@@ -226,8 +242,13 @@ fn thread_main(
                 log::warn!("keyvent: tap was force-invalidated externally; dropping local state");
                 drop_local_tap(&mut ctx);
             }
-            // Heartbeat.
-            if ctx.tap.is_some() && Instant::now() >= ctx.hb_next {
+            // Heartbeat. Gate on secure input: while it is active, taps receive
+            // no events, so an injected heartbeat would go unsuppressed into the
+            // password field as a typed character.
+            if ctx.tap.is_some()
+                && Instant::now() >= ctx.hb_next
+                && !ctx.shared.secure_input()
+            {
                 post_heartbeat(&mut ctx);
                 ctx.hb_next = Instant::now() + HEARTBEAT_INTERVAL;
             }
