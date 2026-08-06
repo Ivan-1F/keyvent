@@ -1,17 +1,19 @@
 //! The supervisor thread: owns the permission-lifecycle state machine.
 //!
 //! Detection philosophy: never trust `AXIsProcessTrusted` or tap-disabled
-//! notifications — probe functionally.
+//! notifications — probe functionally, and only ever *observe* (keyvent
+//! injects nothing into the OS event stream):
 //!
 //! - **tap_create probe** (every 1s): ground truth for "can this process filter
-//!   keyboard events right now". NULL = no.
-//! - **heartbeat echo**: end-to-end proof that the tap + callback path is
-//!   alive.
+//!   keyboard events right now". NULL = no. Drives both revocation (teardown)
+//!   and re-grant (rebuild).
+//! - **tap_is_enabled** (every tick): detects a watchdog-disabled or otherwise
+//!   dead tap that the disabled-notification path missed.
+//! - **kCGEventTapDisabledByUserInput**: administrative disable hint (unreliable
+//!   on revocation, free to act on when it does arrive).
 //!
-//! Revocation = heartbeat lost AND probe NULL. A lost heartbeat with a healthy
-//! probe is transient (secure input, screen lock, sleep/wake, inert tap) and is
-//! healed by a rebuild. All automated recovery is budgeted; the only unbudgeted
-//! action is *tearing down*, which always moves the system toward safety.
+//! All automated recovery is budgeted (Cooldown); the only unbudgeted action is
+//! *tearing down*, which always moves the system toward safety.
 
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -33,24 +35,14 @@ use super::{TapShared, TapThread};
 
 const TICK: Duration = Duration::from_millis(200);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
-/// Heartbeat gaps (at 500ms interval) before entering Suspicion.
-const HB_LOSS_GAP: u32 = 3;
-/// Time in Suspicion after a rebuild before counting a failed recovery cycle.
-const SUSPICION_GRACE: Duration = Duration::from_secs(3);
+/// How long the tap may stay disabled before we treat it as dead and rebuild.
+/// The callback re-enables instantly on ByTimeout, so anything past ~1s means
+/// re-enable failed or the notification never came.
+const TAP_DISABLED_GRACE: Duration = Duration::from_secs(1);
 /// Failed recovery cycles before Cooldown.
 const MAX_RECOVERY_CYCLES: u32 = 3;
 const COOLDOWN_DURATION: Duration = Duration::from_secs(30);
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-
-// HIToolbox is not independently linkable; the Carbon umbrella re-exports it.
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn IsSecureEventInputEnabled() -> bool;
-}
-
-fn secure_input_active() -> bool {
-    unsafe { IsSecureEventInputEnabled() }
-}
 
 /// Create + immediately invalidate a throwaway tap: the functional permission
 /// probe.
@@ -88,14 +80,11 @@ fn probe_tap() -> bool {
 enum State {
     /// No tap installed; probing for permission.
     Silent,
-    /// Tap installed and heartbeats echoing.
+    /// Tap installed and delivering events.
     Running,
-    /// Heartbeat lost; cause not yet discriminated.
-    Suspicion {
-        entered: Instant,
-        rebuilt: bool,
-        acked_at_entry: u32,
-    },
+    /// Something looks wrong (probe NULL, tap disabled, user-input disable);
+    /// the probe discriminates revocation from transient death.
+    Suspicion { rebuilt: bool },
     /// Recovery budget exhausted; doing nothing but probing.
     Cooldown { until: Instant },
 }
@@ -146,15 +135,12 @@ fn supervise(
     let mut state = State::Silent;
     let mut probe_due = Instant::now(); // probe immediately on start
     let mut cycles = 0u32;
+    // When the tap was first seen continuously disabled (None while enabled).
+    let mut disabled_since: Option<Instant> = None;
 
     while !shutdown.load(SeqCst) {
         std::thread::sleep(TICK);
         let now = Instant::now();
-
-        // Poll secure input on this thread only (IsSecureEventInputEnabled is
-        // documented "Not thread safe" in the SDK) and publish it for the tap
-        // thread, which gates heartbeat injection on it.
-        shared.set_secure_input(secure_input_active());
 
         // Periodic probe; entering Suspicion forces it sooner.
         let mut probed: Option<bool> = None;
@@ -167,6 +153,7 @@ fn supervise(
             State::Silent => {
                 if probed == Some(true) && tap.install() {
                     cycles = 0;
+                    disabled_since = None;
                     state = State::Running;
                     broadcast.publish(Status::Running);
                     continue;
@@ -175,38 +162,39 @@ fn supervise(
             }
 
             State::Running => {
-                let gap = shared.heartbeat_gap();
+                // Watchdog-disabled detection: the callback re-enables instantly,
+                // so a continuously disabled tap means re-enable failed or the
+                // notification never arrived.
+                let tap_dead = match shared.tap_is_enabled() {
+                    Some(false) => {
+                        let since = disabled_since.get_or_insert(now);
+                        since.elapsed() >= TAP_DISABLED_GRACE
+                    }
+                    _ => {
+                        disabled_since = None;
+                        false
+                    }
+                };
+
                 if shared.take_user_input_disabled() {
                     log::warn!("keyvent: tap disabled by user input; entering suspicion");
-                    state = State::Suspicion {
-                        entered: now,
-                        rebuilt: false,
-                        acked_at_entry: shared.hb_acked(),
-                    };
+                    state = State::Suspicion { rebuilt: false };
                     probe_due = now; // discriminate immediately
-                } else if gap >= HB_LOSS_GAP {
-                    log::warn!("keyvent: heartbeat gap {gap}; entering suspicion");
-                    state = State::Suspicion {
-                        entered: now,
-                        rebuilt: false,
-                        acked_at_entry: shared.hb_acked(),
-                    };
+                } else if probed == Some(false) {
+                    // Ground truth says we cannot filter right now (revocation
+                    // or stale permission). Suspicion re-probes to confirm
+                    // before tearing down; a transient NULL heals as a rebuild.
+                    log::warn!("keyvent: probe NULL while running; entering suspicion");
+                    state = State::Suspicion { rebuilt: false };
+                    probe_due = now;
+                } else if tap_dead {
+                    log::warn!("keyvent: tap continuously disabled; entering suspicion");
+                    state = State::Suspicion { rebuilt: false };
                     probe_due = now;
                 }
             }
 
-            State::Suspicion {
-                entered,
-                rebuilt,
-                acked_at_entry,
-            } => {
-                // Recovery check: any new echo since entry means we're healing.
-                if shared.hb_acked() > *acked_at_entry {
-                    log::info!("keyvent: heartbeat recovered; back to running");
-                    cycles = 0;
-                    state = State::Running;
-                    continue;
-                }
+            State::Suspicion { rebuilt } => {
                 match probed {
                     Some(false) => {
                         // Revocation confirmed: tear down immediately. force_invalidate
@@ -215,23 +203,24 @@ fn supervise(
                         shared.force_invalidate();
                         tap.teardown();
                         cycles = 0;
+                        disabled_since = None;
                         state = State::Silent;
                         broadcast.publish(Status::Silent);
                     }
                     Some(true) => {
-                        if secure_input_active() {
-                            // Password field / lock screen: events bypass taps by
-                            // design. Wait it out; do NOT escalate.
-                            continue;
-                        }
                         if !*rebuilt {
-                            // Transient death (sleep/wake, inert tap): rebuild once.
-                            log::info!("keyvent: probe healthy but heartbeat lost; rebuilding tap");
+                            // Transient death (disabled tap, sleep/wake, inert tap):
+                            // rebuild once. install() returning true proves the new
+                            // tap exists and is enabled; whether events actually flow
+                            // is not directly observable, so we trust the rebuild and
+                            // rely on the next probe cycle to catch a failure here.
+                            log::info!("keyvent: probe healthy but tap unhealthy; rebuilding");
                             tap.teardown();
                             if tap.install() {
-                                *rebuilt = true;
-                                *acked_at_entry = shared.hb_acked();
-                                *entered = now;
+                                cycles = 0;
+                                disabled_since = None;
+                                state = State::Running;
+                                broadcast.publish(Status::Running);
                             } else {
                                 cycles += 1;
                                 if cycles >= MAX_RECOVERY_CYCLES {
@@ -240,21 +229,6 @@ fn supervise(
                                     };
                                     broadcast.publish(Status::Cooldown);
                                 }
-                            }
-                        } else if entered.elapsed() > SUSPICION_GRACE {
-                            // Rebuild didn't restore the echo: count a cycle, retry.
-                            cycles += 1;
-                            log::warn!(
-                                "keyvent: rebuild did not restore heartbeat (cycle {cycles})"
-                            );
-                            if cycles >= MAX_RECOVERY_CYCLES {
-                                state = State::Cooldown {
-                                    until: now + COOLDOWN_DURATION,
-                                };
-                                broadcast.publish(Status::Cooldown);
-                            } else {
-                                *rebuilt = false;
-                                *entered = now;
                             }
                         }
                     }
@@ -269,6 +243,7 @@ fn supervise(
                 if now >= *until || probed == Some(false) {
                     log::info!("keyvent: cooldown over; resuming normal operation");
                     cycles = 0;
+                    disabled_since = None;
                     state = State::Silent;
                     broadcast.publish(Status::Silent);
                 }

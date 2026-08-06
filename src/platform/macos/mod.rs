@@ -1,4 +1,4 @@
-//! The tap thread: owns the CGEventTap, its CFRunLoop, and the heartbeat.
+//! The tap thread: owns the CGEventTap and its CFRunLoop.
 //!
 //! Threading model:
 //! - The tap thread is the ONLY thread that runs the event-tap callback, so all
@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use objc2_core_foundation::{
     CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes,
@@ -49,32 +49,18 @@ const TAP_EVENT_MASK: u64 = (1u64 << CGEventType::KeyDown.0)
     | (1u64 << CGEventType::FlagsChanged.0);
 
 const RUN_LOOP_SLICE: Duration = Duration::from_millis(100);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const INSTALL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// F20: in the macOS keycode space but absent from most physical keyboards.
-const HEARTBEAT_KEYCODE: Keycode = 90;
-/// Marker in the high 32 bits of `kCGEventSourceUserData` for our own injected
-/// events.
-const MAGIC_HIGH: i64 = 0x4B56_5400_0000_0000;
 
 /// State shared between the tap thread and the supervisor thread.
 pub(crate) struct TapShared {
     /// Live tap handle. The Mutex serializes the slot swap; the CF operations
     /// on the handle itself (enable/invalidate) are documented thread-safe.
     handle: Mutex<Option<TapHandle>>,
-    hb_sent: AtomicU32,
-    hb_acked: AtomicU32,
     /// kCGEventTapDisabledByTimeout deliveries since spawn.
     timeouts: AtomicU32,
     /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on
     /// this.
     user_input_disabled: AtomicBool,
-    /// Secure input (password field / lock screen) is active, polled by the
-    /// supervisor thread. While set, the tap thread must not inject heartbeat
-    /// events: taps receive nothing in this state, so an injected event would
-    /// land unsuppressed in the password field as a typed character.
-    secure_input: AtomicBool,
 }
 
 struct TapHandle(CFRetained<CFMachPort>);
@@ -88,22 +74,9 @@ impl TapShared {
     pub(crate) fn new() -> Self {
         Self {
             handle: Mutex::new(None),
-            hb_sent: AtomicU32::new(0),
-            hb_acked: AtomicU32::new(0),
             timeouts: AtomicU32::new(0),
             user_input_disabled: AtomicBool::new(false),
-            secure_input: AtomicBool::new(false),
         }
-    }
-
-    /// Supervisor thread only: publish the latest secure-input state.
-    pub(crate) fn set_secure_input(&self, active: bool) {
-        self.secure_input.store(active, SeqCst);
-    }
-
-    /// True while secure input is active (heartbeat injection forbidden).
-    pub(crate) fn secure_input(&self) -> bool {
-        self.secure_input.load(SeqCst)
     }
 
     /// Force-invalidate the live tap from any thread. Returns true if a tap was
@@ -119,14 +92,10 @@ impl TapShared {
         }
     }
 
-    /// Number of heartbeats sent but not yet echoed back through the tap.
-    pub(crate) fn heartbeat_gap(&self) -> u32 {
-        self.hb_sent.load(SeqCst).saturating_sub(self.hb_acked())
-    }
-
-    /// Last heartbeat sequence number echoed back.
-    pub(crate) fn hb_acked(&self) -> u32 {
-        self.hb_acked.load(SeqCst)
+    /// Whether the live tap is currently delivering events. None if no tap.
+    pub(crate) fn tap_is_enabled(&self) -> Option<bool> {
+        let handle = self.handle.lock().unwrap();
+        handle.as_ref().map(|h| CGEvent::tap_is_enabled(&h.0))
     }
 
     pub(crate) fn take_user_input_disabled(&self) -> bool {
@@ -199,8 +168,6 @@ struct Ctx {
     pairing: Pairing,
     tap: Option<CFRetained<CFMachPort>>,
     source: Option<CFRetained<CFRunLoopSource>>,
-    hb_next: Instant,
-    hb_seq: u32,
     shared: Arc<TapShared>,
 }
 
@@ -216,8 +183,6 @@ fn thread_main(
         pairing: Pairing::default(),
         tap: None,
         source: None,
-        hb_next: Instant::now(),
-        hb_seq: 0,
         shared,
     };
 
@@ -241,16 +206,6 @@ fn thread_main(
             if ctx.shared.handle.lock().unwrap().is_none() {
                 log::warn!("keyvent: tap was force-invalidated externally; dropping local state");
                 drop_local_tap(&mut ctx);
-            }
-            // Heartbeat. Gate on secure input: while it is active, taps receive
-            // no events, so an injected heartbeat would go unsuppressed into the
-            // password field as a typed character.
-            if ctx.tap.is_some()
-                && Instant::now() >= ctx.hb_next
-                && !ctx.shared.secure_input()
-            {
-                post_heartbeat(&mut ctx);
-                ctx.hb_next = Instant::now() + HEARTBEAT_INTERVAL;
             }
         } else {
             // No tap installed: wait for commands without burning CPU.
@@ -313,7 +268,6 @@ fn install(ctx: &mut Ctx) -> bool {
     *ctx.shared.handle.lock().unwrap() = Some(TapHandle(tap.clone()));
     ctx.tap = Some(tap);
     ctx.source = Some(source);
-    ctx.hb_next = Instant::now();
     log::info!("keyvent: event tap installed");
     true
 }
@@ -389,28 +343,6 @@ fn modifiers_from_cg(flags: CGEventFlags) -> Modifiers {
     Modifiers::from_bits(bits)
 }
 
-/// Inject a marked heartbeat event; the tap callback recognizes the marker,
-/// records the echo, and swallows it.
-fn post_heartbeat(ctx: &mut Ctx) {
-    ctx.hb_seq = ctx.hb_seq.wrapping_add(1);
-    let seq = ctx.hb_seq;
-    let marker = MAGIC_HIGH | seq as i64;
-    if let Some(src) = CGEventSource::new(CGEventSourceStateID::Private) {
-        CGEventSource::set_user_data(Some(&src), marker);
-        for down in [true, false] {
-            if let Some(ev) = CGEvent::new_keyboard_event(Some(&src), HEARTBEAT_KEYCODE, down) {
-                CGEvent::set_integer_value_field(
-                    Some(&ev),
-                    CGEventField::EventSourceUserData,
-                    marker,
-                );
-                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&ev));
-            }
-        }
-    }
-    ctx.shared.hb_sent.store(seq, SeqCst);
-}
-
 /// The raw event-tap callback. Runs on the tap thread only.
 ///
 /// Latency contract: everything here is O(µs) — convert, bookkeeping, and the
@@ -443,14 +375,7 @@ unsafe extern "C-unwind" fn raw_callback(
         return event.as_ptr();
     }
 
-    // Our own heartbeat?
-    let marker = CGEvent::integer_value_field(Some(cg), CGEventField::EventSourceUserData);
-    if (marker & MAGIC_HIGH) == MAGIC_HIGH {
-        let seq = (marker & 0xFFFF_FFFF) as u32;
-        ctx.shared.hb_acked.store(seq, SeqCst);
-        return null_mut();
-    }
-
+    // Our own injected events no longer exist; every event here is real.
     let kind = match event_type {
         CGEventType::KeyDown => RawKind::Down,
         CGEventType::KeyUp => RawKind::Up,
