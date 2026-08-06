@@ -12,8 +12,20 @@
 //! - **kCGEventTapDisabledByUserInput**: administrative disable hint (unreliable
 //!   on revocation, free to act on when it does arrive).
 //!
-//! All automated recovery is budgeted (Cooldown); the only unbudgeted action is
-//! *tearing down*, which always moves the system toward safety.
+//! The state machine has exactly two states. Every anomaly takes the same
+//! safe-direction path — force_invalidate + teardown into Silent — and
+//! Silent's ordinary probing brings the tap back when conditions allow:
+//!
+//! ```text
+//! Running --any anomaly--> force_invalidate + Teardown --> Silent
+//! Silent  --probe OK & install succeeds--> Running
+//! ```
+//!
+//! There is deliberately no cooldown/budget machinery: the loop is rate-limited
+//! by PROBE_INTERVAL, every pass goes through a tap-free (input-safe) state,
+//! and a rebuild costs no more than the probe that already runs every second.
+//! The escape hatch for a hypothetical poisonous-callback loop is the existing
+//! `timeouts` counter, documented in docs/design.md.
 
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -39,9 +51,6 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// The callback re-enables instantly on ByTimeout, so anything past ~1s means
 /// re-enable failed or the notification never came.
 const TAP_DISABLED_GRACE: Duration = Duration::from_secs(1);
-/// Failed recovery cycles before Cooldown.
-const MAX_RECOVERY_CYCLES: u32 = 3;
-const COOLDOWN_DURATION: Duration = Duration::from_secs(30);
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Create + immediately invalidate a throwaway tap: the functional permission
@@ -82,11 +91,6 @@ enum State {
     Silent,
     /// Tap installed and delivering events.
     Running,
-    /// Something looks wrong (probe NULL, tap disabled, user-input disable);
-    /// the probe discriminates revocation from transient death.
-    Suspicion { rebuilt: bool },
-    /// Recovery budget exhausted; doing nothing but probing.
-    Cooldown { until: Instant },
 }
 
 pub(crate) struct Supervisor {
@@ -134,7 +138,6 @@ fn supervise(
 ) {
     let mut state = State::Silent;
     let mut probe_due = Instant::now(); // probe immediately on start
-    let mut cycles = 0u32;
     // When the tap was first seen continuously disabled (None while enabled).
     let mut disabled_since: Option<Instant> = None;
 
@@ -142,17 +145,16 @@ fn supervise(
         std::thread::sleep(TICK);
         let now = Instant::now();
 
-        // Periodic probe; entering Suspicion forces it sooner.
+        // Periodic probe.
         let mut probed: Option<bool> = None;
         if now >= probe_due {
             probed = Some(probe_tap());
             probe_due = now + PROBE_INTERVAL;
         }
 
-        match &mut state {
+        match &state {
             State::Silent => {
                 if probed == Some(true) && tap.install() {
-                    cycles = 0;
                     disabled_since = None;
                     state = State::Running;
                     broadcast.publish(Status::Running);
@@ -176,73 +178,25 @@ fn supervise(
                     }
                 };
 
-                if shared.take_user_input_disabled() {
-                    log::warn!("keyvent: tap disabled by user input; entering suspicion");
-                    state = State::Suspicion { rebuilt: false };
-                    probe_due = now; // discriminate immediately
+                // Every anomaly takes the same safe-direction path; Silent's
+                // probing brings the tap back when conditions allow.
+                let anomaly = if shared.take_user_input_disabled() {
+                    Some("tap disabled by user input")
                 } else if probed == Some(false) {
-                    // Ground truth says we cannot filter right now (revocation
-                    // or stale permission). Suspicion re-probes to confirm
-                    // before tearing down; a transient NULL heals as a rebuild.
-                    log::warn!("keyvent: probe NULL while running; entering suspicion");
-                    state = State::Suspicion { rebuilt: false };
-                    probe_due = now;
+                    // Ground truth: we cannot filter right now (revocation or
+                    // stale permission).
+                    Some("probe NULL while running")
                 } else if tap_dead {
-                    log::warn!("keyvent: tap continuously disabled; entering suspicion");
-                    state = State::Suspicion { rebuilt: false };
-                    probe_due = now;
-                }
-            }
-
-            State::Suspicion { rebuilt } => {
-                match probed {
-                    Some(false) => {
-                        // Revocation confirmed: tear down immediately. force_invalidate
-                        // works even if the tap thread is stuck in a user callback.
-                        log::warn!("keyvent: permission revoked (probe NULL); tearing down tap");
-                        shared.force_invalidate();
-                        tap.teardown();
-                        cycles = 0;
-                        disabled_since = None;
-                        state = State::Silent;
-                        broadcast.publish(Status::Silent);
-                    }
-                    Some(true) => {
-                        if !*rebuilt {
-                            // Transient death (disabled tap, sleep/wake, inert tap):
-                            // rebuild once. install() returning true proves the new
-                            // tap exists and is enabled; whether events actually flow
-                            // is not directly observable, so we trust the rebuild and
-                            // rely on the next probe cycle to catch a failure here.
-                            log::info!("keyvent: probe healthy but tap unhealthy; rebuilding");
-                            tap.teardown();
-                            if tap.install() {
-                                cycles = 0;
-                                disabled_since = None;
-                                state = State::Running;
-                                broadcast.publish(Status::Running);
-                            } else {
-                                cycles += 1;
-                                if cycles >= MAX_RECOVERY_CYCLES {
-                                    state = State::Cooldown {
-                                        until: now + COOLDOWN_DURATION,
-                                    };
-                                    broadcast.publish(Status::Cooldown);
-                                }
-                            }
-                        }
-                    }
-                    None => {}
-                }
-            }
-
-            State::Cooldown { until } => {
-                // Permission loss ends the cooldown into a clean Silent; otherwise
-                // wait it out (a healthy probe must NOT cut the cooldown short,
-                // since transient-failure cooldowns happen with a healthy probe).
-                if now >= *until || probed == Some(false) {
-                    log::info!("keyvent: cooldown over; resuming normal operation");
-                    cycles = 0;
+                    Some("tap continuously disabled")
+                } else {
+                    None
+                };
+                if let Some(reason) = anomaly {
+                    log::warn!("keyvent: {reason}; tearing down tap");
+                    // force_invalidate works even if the tap thread is stuck in
+                    // a user callback; the queued Teardown drops local state.
+                    shared.force_invalidate();
+                    tap.teardown();
                     disabled_since = None;
                     state = State::Silent;
                     broadcast.publish(Status::Silent);

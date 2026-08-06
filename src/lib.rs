@@ -56,10 +56,13 @@ use status::StatusBroadcast;
 pub enum Status {
     /// Events are flowing to the callback.
     Running = 0,
-    /// No Accessibility permission. Nothing is sent to the callback.
+    /// No event stream is active: no Accessibility permission, permission
+    /// revoked, or the tap was just torn down and is being rebuilt (a brief
+    /// transitional state). Nothing is sent to the callback.
     Silent = 1,
-    /// Automated recovery failed repeatedly; keyvent paused itself to protect
-    /// system input. It resumes on its own when conditions change.
+    /// Reserved for a future rate guard. **Never published by the current
+    /// implementation** — kept in the enum only for API stability. Callers
+    /// must not wait for it.
     Cooldown = 2,
 }
 

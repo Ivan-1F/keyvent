@@ -139,7 +139,16 @@ impl TapThread {
         if self.cmd.send(TapCommand::Install(tx)).is_err() {
             return false;
         }
-        rx.recv_timeout(INSTALL_REPLY_TIMEOUT).unwrap_or(false)
+        match rx.recv_timeout(INSTALL_REPLY_TIMEOUT) {
+            Ok(ok) => ok,
+            Err(_) => {
+                // Timeout means cancel: the queued Install may execute much later
+                // (e.g. after a stuck user callback returns), so append a Teardown
+                // right behind it — the pair's net effect is always zero.
+                let _ = self.cmd.send(TapCommand::Teardown);
+                false
+            }
+        }
     }
 
     /// Ask the tap thread to tear the tap down (non-blocking).
