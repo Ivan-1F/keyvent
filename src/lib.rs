@@ -23,6 +23,7 @@
 //! starts automatically once permission is granted, and stops cleanly on
 //! revocation.
 
+mod cancel;
 mod dispatcher;
 mod event;
 pub mod hotkey;

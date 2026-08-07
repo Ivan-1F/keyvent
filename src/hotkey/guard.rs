@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::cancel::{CancelToken, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, KeyEvent, KeyEventKind, Status};
 
@@ -52,7 +53,7 @@ pub struct HotkeyGuard {
     status: Arc<StatusBroadcast>,
     commands: mpsc::Sender<Command>,
     /// Its death tells the tap-thread callback to unregister.
-    _cancel: mpsc::Sender<()>,
+    _cancel: CancelToken,
 }
 
 /// A pause/resume change sent to the matcher on the tap thread.
@@ -73,14 +74,14 @@ enum Command {
 /// ```
 pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let (cancel, cancelled) = cancel_token();
     let (tx, rx) = mpsc::channel();
     let mut tx = Some(tx);
     let mut matcher = Matcher::new(hotkey, suppression);
     let mut enabled = true;
     let registration = crate::start(move |event| {
         // The guard is gone: unregister — close the channel, stop matching.
-        if matches!(cancel_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+        if cancelled.is_cancelled() {
             tx = None;
             return false;
         }
@@ -108,7 +109,7 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
         pending_guard: Some(HotkeyGuard {
             status,
             commands: cmd_tx.clone(),
-            _cancel: cancel_tx,
+            _cancel: cancel,
         }),
         commands: cmd_tx,
     }

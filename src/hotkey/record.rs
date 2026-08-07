@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::cancel::{CancelToken, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, Key, KeyEvent, KeyEventKind, Modifiers, Status};
 
@@ -54,7 +55,7 @@ pub(crate) static RECORDING: AtomicUsize = AtomicUsize::new(0);
 pub struct Recording {
     status: Arc<StatusBroadcast>,
     /// Its death tells the tap-thread callback to cancel the session.
-    _cancel: mpsc::Sender<()>,
+    _cancel: CancelToken,
 }
 
 /// Record a hotkey from the user's next keystrokes, returning the event
@@ -69,7 +70,7 @@ pub struct Recording {
 /// // Dropping `events` cancels the recording.
 /// ```
 pub fn record() -> RecorderEvents {
-    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let (cancel, cancelled) = cancel_token();
     let (tx, rx) = mpsc::channel();
     let mut tx = Some(tx);
     let mut gesture = Gesture::new();
@@ -78,7 +79,7 @@ pub fn record() -> RecorderEvents {
     let registration = crate::start(move |event| {
         // The guard is gone: cancel the session — release every on guard
         // and close the channel.
-        if matches!(cancel_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+        if cancelled.is_cancelled() {
             drop(pause.take());
             tx = None;
             return false;
@@ -109,7 +110,7 @@ pub fn record() -> RecorderEvents {
         _registration: registration,
         pending_guard: Some(Recording {
             status,
-            _cancel: cancel_tx,
+            _cancel: cancel,
         }),
     }
 }
