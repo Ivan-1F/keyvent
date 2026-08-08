@@ -21,11 +21,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crossbeam_channel as channel;
+
 use crate::cancel::{CancelToken, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, Key, KeyEvent, KeyEventKind, Modifiers, Status};
 
-use super::{Hotkey, MATCH_BITS, modifier_bit_of};
+use super::{Hotkey, MATCH_BITS, RecvError, RecvTimeoutError, TryRecvError, modifier_bit_of};
 
 /// A recording progress or terminal event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +73,7 @@ pub struct Recording {
 /// ```
 pub fn record() -> RecorderEvents {
     let (cancel, cancelled) = cancel_token();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = channel::unbounded();
     let mut tx = Some(tx);
     let mut gesture = Gesture::new();
     let mut pause = Some(RecordingPause::new());
@@ -131,7 +133,7 @@ impl Recording {
 /// `Finished` event is yielded, or when the recording is cancelled.
 /// Dropping it cancels the recording.
 pub struct RecorderEvents {
-    rx: mpsc::Receiver<RecorderEvent>,
+    rx: channel::Receiver<RecorderEvent>,
     /// Keeps the registration alive; dropping it cancels the recording.
     _registration: Guard,
     pending_guard: Option<Recording>,
@@ -144,28 +146,30 @@ impl RecorderEvents {
     }
 
     /// Block until the next event, `Err` once the channel is closed.
-    pub fn recv(&self) -> Result<RecorderEvent, mpsc::RecvError> {
-        self.rx.recv()
+    pub fn recv(&self) -> Result<RecorderEvent, RecvError> {
+        self.rx.recv().map_err(|_| RecvError)
     }
 
     /// The next event if one is pending.
-    pub fn try_recv(&self) -> Result<RecorderEvent, mpsc::TryRecvError> {
-        self.rx.try_recv()
+    pub fn try_recv(&self) -> Result<RecorderEvent, TryRecvError> {
+        self.rx.try_recv().map_err(TryRecvError::from_channel_error)
     }
 
     /// Block up to `timeout` for the next event.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<RecorderEvent, mpsc::RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<RecorderEvent, RecvTimeoutError> {
+        self.rx
+            .recv_timeout(timeout)
+            .map_err(RecvTimeoutError::from_channel_error)
     }
 
     /// An iterator blocking on each event.
-    pub fn iter(&self) -> mpsc::Iter<'_, RecorderEvent> {
-        self.rx.iter()
+    pub fn iter(&self) -> impl Iterator<Item = RecorderEvent> + '_ {
+        std::iter::from_fn(|| self.rx.recv().ok())
     }
 
     /// An iterator over the pending events.
-    pub fn try_iter(&self) -> mpsc::TryIter<'_, RecorderEvent> {
-        self.rx.try_iter()
+    pub fn try_iter(&self) -> impl Iterator<Item = RecorderEvent> + '_ {
+        std::iter::from_fn(|| self.rx.try_recv().ok())
     }
 
     /// Permission lifecycle status of the underlying engine.

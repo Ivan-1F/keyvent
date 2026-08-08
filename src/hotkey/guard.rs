@@ -18,12 +18,14 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel as channel;
+
 use crate::cancel::{CancelToken, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, KeyEvent, KeyEventKind, Status};
 
 use super::record::RECORDING;
-use super::{Hotkey, Suppression};
+use super::{Hotkey, RecvError, RecvTimeoutError, Suppression, TryRecvError};
 
 /// A hotkey activation or deactivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +41,7 @@ pub enum HotkeyEvent {
 ///
 /// HotkeyEvents share the process-wide keyvent engine (see [`crate::start`]).
 pub struct HotkeyEvents {
-    rx: mpsc::Receiver<HotkeyEvent>,
+    rx: channel::Receiver<HotkeyEvent>,
     /// Keeps the registration alive; dropping it unregisters the hotkey.
     _registration: Guard,
     pending_guard: Option<HotkeyGuard>,
@@ -75,7 +77,7 @@ enum Command {
 pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (cancel, cancelled) = cancel_token();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = channel::unbounded();
     let mut tx = Some(tx);
     let mut matcher = Matcher::new(hotkey, suppression);
     let mut enabled = true;
@@ -122,28 +124,30 @@ impl HotkeyEvents {
     }
 
     /// Block until the next activation, `Err` once the channel is closed.
-    pub fn recv(&self) -> Result<HotkeyEvent, mpsc::RecvError> {
-        self.rx.recv()
+    pub fn recv(&self) -> Result<HotkeyEvent, RecvError> {
+        self.rx.recv().map_err(|_| RecvError)
     }
 
     /// The next activation if one is pending.
-    pub fn try_recv(&self) -> Result<HotkeyEvent, mpsc::TryRecvError> {
-        self.rx.try_recv()
+    pub fn try_recv(&self) -> Result<HotkeyEvent, TryRecvError> {
+        self.rx.try_recv().map_err(TryRecvError::from_channel_error)
     }
 
     /// Block up to `timeout` for the next activation.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<HotkeyEvent, mpsc::RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<HotkeyEvent, RecvTimeoutError> {
+        self.rx
+            .recv_timeout(timeout)
+            .map_err(RecvTimeoutError::from_channel_error)
     }
 
     /// An iterator blocking on each activation.
-    pub fn iter(&self) -> mpsc::Iter<'_, HotkeyEvent> {
-        self.rx.iter()
+    pub fn iter(&self) -> impl Iterator<Item = HotkeyEvent> + '_ {
+        std::iter::from_fn(|| self.rx.recv().ok())
     }
 
     /// An iterator over the pending activations.
-    pub fn try_iter(&self) -> mpsc::TryIter<'_, HotkeyEvent> {
-        self.rx.try_iter()
+    pub fn try_iter(&self) -> impl Iterator<Item = HotkeyEvent> + '_ {
+        std::iter::from_fn(|| self.rx.try_recv().ok())
     }
 
     /// Suspend matching: no new activations start and nothing is swallowed.

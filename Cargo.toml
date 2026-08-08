@@ -14,6 +14,7 @@ exclude = ["src/bin/", "scripts/", "docs/", "target/"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 
 [dependencies]
+crossbeam-channel = "0.5"
 log = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]

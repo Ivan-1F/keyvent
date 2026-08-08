@@ -194,6 +194,78 @@ pub enum Suppression {
     Pass,
 }
 
+/// No more events will arrive: the event stream is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvError;
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("receiving on a closed channel")
+    }
+}
+
+impl Error for RecvError {}
+
+/// A [`recv_timeout`](HotkeyEvents::recv_timeout) failure: the wait timed
+/// out, or the stream closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    /// The timeout elapsed with no event received.
+    Timeout,
+    /// The stream is closed; no more events will arrive.
+    Closed,
+}
+
+impl RecvTimeoutError {
+    pub(crate) fn from_channel_error(e: crossbeam_channel::RecvTimeoutError) -> Self {
+        match e {
+            crossbeam_channel::RecvTimeoutError::Timeout => Self::Timeout,
+            crossbeam_channel::RecvTimeoutError::Disconnected => Self::Closed,
+        }
+    }
+}
+
+impl fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("timed out waiting for an event"),
+            Self::Closed => f.write_str("receiving on a closed channel"),
+        }
+    }
+}
+
+impl Error for RecvTimeoutError {}
+
+/// A [`try_recv`](HotkeyEvents::try_recv) failure: no event is pending, or
+/// the stream closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// No event is pending right now.
+    Empty,
+    /// The stream is closed; no more events will arrive.
+    Closed,
+}
+
+impl TryRecvError {
+    pub(crate) fn from_channel_error(e: crossbeam_channel::TryRecvError) -> Self {
+        match e {
+            crossbeam_channel::TryRecvError::Empty => Self::Empty,
+            crossbeam_channel::TryRecvError::Disconnected => Self::Closed,
+        }
+    }
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("no event is pending"),
+            Self::Closed => f.write_str("receiving on a closed channel"),
+        }
+    }
+}
+
+impl Error for TryRecvError {}
+
 /// Modifier bits relevant for matching.
 const MATCH_BITS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::CONTROL)

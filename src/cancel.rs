@@ -4,12 +4,12 @@
 //! death. Neither half ever blocks; the watcher is safe to poll on the tap
 //! thread.
 
-use std::sync::mpsc;
+use crossbeam_channel::{self as channel, Receiver, Sender};
 
 /// A cancellation pair: dropping the [`CancelToken`] flips
 /// [`CancelWatcher::is_cancelled`] to `true`.
 pub(crate) fn cancel_token() -> (CancelToken, CancelWatcher) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = channel::unbounded();
     (CancelToken { _signal: tx }, CancelWatcher(rx))
 }
 
@@ -18,16 +18,16 @@ pub(crate) fn cancel_token() -> (CancelToken, CancelWatcher) {
 /// and it cannot fail to fire, since it takes no method call.
 pub(crate) struct CancelToken {
     /// Kept only so that dropping it disconnects the watcher.
-    _signal: mpsc::Sender<()>,
+    _signal: Sender<()>,
 }
 
 /// The observing half of a cancellation signal.
-pub(crate) struct CancelWatcher(mpsc::Receiver<()>);
+pub(crate) struct CancelWatcher(Receiver<()>);
 
 impl CancelWatcher {
     /// Whether the token is gone. Never blocks.
     pub(crate) fn is_cancelled(&self) -> bool {
-        matches!(self.0.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+        matches!(self.0.try_recv(), Err(channel::TryRecvError::Disconnected))
     }
 }
 
