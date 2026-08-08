@@ -19,8 +19,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as channel;
+use crossbeam_channel::select_biased;
 
-use crate::cancel::{CancelToken, cancel_token};
+use crate::cancel::{CancelToken, CancelWatcher, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, KeyEvent, KeyEventKind, Status};
 
@@ -42,6 +43,8 @@ pub enum HotkeyEvent {
 /// HotkeyEvents share the process-wide keyvent engine (see [`crate::start`]).
 pub struct HotkeyEvents {
     rx: channel::Receiver<HotkeyEvent>,
+    /// Sees the guard's death; closing the stream is a receiver-side act.
+    cancelled: CancelWatcher,
     /// Keeps the registration alive; dropping it unregisters the hotkey.
     _registration: Guard,
     pending_guard: Option<HotkeyGuard>,
@@ -49,8 +52,7 @@ pub struct HotkeyEvents {
 }
 
 /// A registered hotkey's control guard, see [`HotkeyEvents::guard`].
-/// Dropping it unregisters the hotkey; the event channel closes at the
-/// next keyboard event.
+/// Dropping it unregisters the hotkey; the event channel closes at once.
 pub struct HotkeyGuard {
     status: Arc<StatusBroadcast>,
     commands: mpsc::Sender<Command>,
@@ -77,13 +79,18 @@ enum Command {
 pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (cancel, cancelled) = cancel_token();
+    // The tap-thread closure watches its own clone; cancellation reaches
+    // every watcher.
+    let cancelled_on_tap = cancelled.clone();
     let (tx, rx) = channel::unbounded();
     let mut tx = Some(tx);
     let mut matcher = Matcher::new(hotkey, suppression);
     let mut enabled = true;
     let registration = crate::start(move |event| {
-        // The guard is gone: unregister — close the channel, stop matching.
-        if cancelled.is_cancelled() {
+        // The guard is gone: stop matching, pass everything through. The
+        // receiver side sees the cancellation on its own; dropping our
+        // sender just stops queueing for a dead listener.
+        if cancelled_on_tap.is_cancelled() {
             tx = None;
             return false;
         }
@@ -107,6 +114,7 @@ pub fn on(hotkey: Hotkey, suppression: Suppression) -> HotkeyEvents {
     let status = registration.status_broadcast();
     HotkeyEvents {
         rx,
+        cancelled,
         _registration: registration,
         pending_guard: Some(HotkeyGuard {
             status,
@@ -125,29 +133,39 @@ impl HotkeyEvents {
 
     /// Block until the next activation, `Err` once the channel is closed.
     pub fn recv(&self) -> Result<HotkeyEvent, RecvError> {
-        self.rx.recv().map_err(|_| RecvError)
+        // Cancellation wins over queued events: once the guard is gone the
+        // stream is closed, whatever is still buffered.
+        select_biased! {
+            recv(self.cancelled.as_receiver()) -> _ => Err(RecvError),
+            recv(&self.rx) -> msg => msg.map_err(|_| RecvError),
+        }
     }
 
     /// The next activation if one is pending.
     pub fn try_recv(&self) -> Result<HotkeyEvent, TryRecvError> {
+        if self.cancelled.is_cancelled() {
+            return Err(TryRecvError::Closed);
+        }
         self.rx.try_recv().map_err(TryRecvError::from_channel_error)
     }
 
     /// Block up to `timeout` for the next activation.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<HotkeyEvent, RecvTimeoutError> {
-        self.rx
-            .recv_timeout(timeout)
-            .map_err(RecvTimeoutError::from_channel_error)
+        select_biased! {
+            recv(self.cancelled.as_receiver()) -> _ => Err(RecvTimeoutError::Closed),
+            recv(&self.rx) -> msg => msg.map_err(|_| RecvTimeoutError::Closed),
+            recv(channel::after(timeout)) -> _ => Err(RecvTimeoutError::Timeout),
+        }
     }
 
     /// An iterator blocking on each activation.
     pub fn iter(&self) -> impl Iterator<Item = HotkeyEvent> + '_ {
-        std::iter::from_fn(|| self.rx.recv().ok())
+        std::iter::from_fn(|| self.recv().ok())
     }
 
     /// An iterator over the pending activations.
     pub fn try_iter(&self) -> impl Iterator<Item = HotkeyEvent> + '_ {
-        std::iter::from_fn(|| self.rx.try_recv().ok())
+        std::iter::from_fn(|| self.try_recv().ok())
     }
 
     /// Suspend matching: no new activations start and nothing is swallowed.
@@ -437,5 +455,62 @@ mod tests {
         // One hold, one Up.
         let (event, _) = m.handle(&ev(Key::AltLeft, KeyEventKind::Release, Modifiers::NONE));
         assert!(matches!(event, Some(HotkeyEvent::Up { .. })));
+    }
+
+    #[test]
+    fn guard_drop_closes_a_blocked_recv_at_once() {
+        let _lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
+        let mut events = on(
+            Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)),
+            Suppression::Pass,
+        );
+        let guard = events.guard().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done_tx.send(events.recv());
+        });
+        drop(guard);
+        // No keyboard event is needed — the close is receiver-side.
+        match done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Err(_)) => {}
+            other => panic!("expected a closed channel, got {other:?}"),
+        }
+        // `done` only means the send ran; join so the worker's events (and
+        // its engine reference) are gone before the lock is released.
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn closed_channel_stays_closed() {
+        let _lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
+        let mut events = on(
+            Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)),
+            Suppression::Pass,
+        );
+        let guard = events.guard().unwrap();
+        drop(guard);
+        assert!(events.recv().is_err());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Closed)));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Closed)
+        ));
+        assert_eq!(events.try_iter().count(), 0);
+        assert_eq!(events.iter().count(), 0);
+    }
+
+    #[test]
+    fn recv_timeout_times_out_while_open() {
+        let _lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
+        let events = on(
+            Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)),
+            Suppression::Pass,
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(10));
     }
 }

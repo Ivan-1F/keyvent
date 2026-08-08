@@ -236,12 +236,18 @@ impl Guard {
     }
 }
 
+/// Serializes tests that hold the process-wide engine: they would race with
+/// the engine lifecycle assertions below.
+#[cfg(test)]
+pub(crate) static ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use crate::ENGINE;
 
     #[test]
     fn guards_share_and_release_engine() {
+        let _lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
         let g1 = crate::start(|_| false);
         let g2 = crate::start(|_| false);
         assert_eq!(ENGINE.lock().unwrap().as_ref().unwrap().strong_count(), 2);

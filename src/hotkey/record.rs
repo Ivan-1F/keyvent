@@ -17,13 +17,14 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crossbeam_channel as channel;
+use crossbeam_channel::select_biased;
 
-use crate::cancel::{CancelToken, cancel_token};
+use crate::cancel::{CancelToken, CancelWatcher, cancel_token};
 use crate::status::StatusBroadcast;
 use crate::{Guard, Key, KeyEvent, KeyEventKind, Modifiers, Status};
 
@@ -53,11 +54,21 @@ pub(crate) static RECORDING: AtomicUsize = AtomicUsize::new(0);
 
 /// A hotkey recording session's control guard, see
 /// [`RecorderEvents::guard`]. Dropping it cancels the recording; the event
-/// channel closes at the next keyboard event.
+/// channel closes at once.
 pub struct Recording {
     status: Arc<StatusBroadcast>,
+    /// Dropping the guard lifts the recording pause synchronously.
+    pause: Arc<RecordingPause>,
     /// Its death tells the tap-thread callback to cancel the session.
     _cancel: CancelToken,
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        // Runs before `_cancel` drops, so the channel can only report
+        // closed after the pause is already lifted.
+        self.pause.release();
+    }
 }
 
 /// Record a hotkey from the user's next keystrokes, returning the event
@@ -73,16 +84,23 @@ pub struct Recording {
 /// ```
 pub fn record() -> RecorderEvents {
     let (cancel, cancelled) = cancel_token();
+    // The tap-thread closure watches its own clone; cancellation reaches
+    // every watcher.
+    let cancelled_on_tap = cancelled.clone();
     let (tx, rx) = channel::unbounded();
     let mut tx = Some(tx);
     let mut gesture = Gesture::new();
-    let mut pause = Some(RecordingPause::new());
+    // Shared by the closure, the stream and the Recording guard; the first
+    // release wins.
+    let pause = Arc::new(RecordingPause::new());
+    let closure_pause = pause.clone();
+    let events_pause = pause.clone();
     let mut finished = false;
     let registration = crate::start(move |event| {
-        // The guard is gone: cancel the session — release every on guard
-        // and close the channel.
-        if cancelled.is_cancelled() {
-            drop(pause.take());
+        // The guard is gone: pass events through. Its drop has already
+        // lifted the recording pause; dropping our sender stops queueing
+        // for a dead listener.
+        if cancelled_on_tap.is_cancelled() {
             tx = None;
             return false;
         }
@@ -101,17 +119,20 @@ pub fn record() -> RecorderEvents {
             // Closing the channel ends the receiver's loop after the
             // terminal event — a recording, unlike a binding, has an end.
             tx = None;
-            // Dropping the hold lets every on guard resume matching.
-            drop(pause.take());
+            // Lifting the hold lets every on guard resume matching.
+            closure_pause.release();
         }
         step.swallow
     });
     let status = registration.status_broadcast();
     RecorderEvents {
         rx,
+        cancelled,
+        pause: events_pause,
         _registration: registration,
         pending_guard: Some(Recording {
             status,
+            pause,
             _cancel: cancel,
         }),
     }
@@ -134,9 +155,21 @@ impl Recording {
 /// Dropping it cancels the recording.
 pub struct RecorderEvents {
     rx: channel::Receiver<RecorderEvent>,
+    /// Sees the guard's death; closing the stream is a receiver-side act.
+    cancelled: CancelWatcher,
+    /// Dropping the stream lifts the recording pause synchronously.
+    pause: Arc<RecordingPause>,
     /// Keeps the registration alive; dropping it cancels the recording.
     _registration: Guard,
     pending_guard: Option<Recording>,
+}
+
+impl Drop for RecorderEvents {
+    fn drop(&mut self) {
+        // "Dropping events cancels the recording": lift the pause at once,
+        // even if the Recording guard was taken out and is still alive.
+        self.pause.release();
+    }
 }
 
 impl RecorderEvents {
@@ -147,29 +180,39 @@ impl RecorderEvents {
 
     /// Block until the next event, `Err` once the channel is closed.
     pub fn recv(&self) -> Result<RecorderEvent, RecvError> {
-        self.rx.recv().map_err(|_| RecvError)
+        // Cancellation wins over queued events: once the guard is gone the
+        // stream is closed, whatever is still buffered.
+        select_biased! {
+            recv(self.cancelled.as_receiver()) -> _ => Err(RecvError),
+            recv(&self.rx) -> msg => msg.map_err(|_| RecvError),
+        }
     }
 
     /// The next event if one is pending.
     pub fn try_recv(&self) -> Result<RecorderEvent, TryRecvError> {
+        if self.cancelled.is_cancelled() {
+            return Err(TryRecvError::Closed);
+        }
         self.rx.try_recv().map_err(TryRecvError::from_channel_error)
     }
 
     /// Block up to `timeout` for the next event.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<RecorderEvent, RecvTimeoutError> {
-        self.rx
-            .recv_timeout(timeout)
-            .map_err(RecvTimeoutError::from_channel_error)
+        select_biased! {
+            recv(self.cancelled.as_receiver()) -> _ => Err(RecvTimeoutError::Closed),
+            recv(&self.rx) -> msg => msg.map_err(|_| RecvTimeoutError::Closed),
+            recv(channel::after(timeout)) -> _ => Err(RecvTimeoutError::Timeout),
+        }
     }
 
     /// An iterator blocking on each event.
     pub fn iter(&self) -> impl Iterator<Item = RecorderEvent> + '_ {
-        std::iter::from_fn(|| self.rx.recv().ok())
+        std::iter::from_fn(|| self.recv().ok())
     }
 
     /// An iterator over the pending events.
     pub fn try_iter(&self) -> impl Iterator<Item = RecorderEvent> + '_ {
-        std::iter::from_fn(|| self.rx.try_recv().ok())
+        std::iter::from_fn(|| self.try_recv().ok())
     }
 
     /// Permission lifecycle status of the underlying engine.
@@ -184,19 +227,33 @@ impl RecorderEvents {
 }
 
 /// A recording session's hold on the live-recording count: while held, every
-/// `on` guard pauses matching; dropping it lets them resume.
-struct RecordingPause;
+/// `on` guard pauses matching. Shared by the tap-thread closure and the
+/// `Recording` guard; [`release`](Self::release) is idempotent — the first
+/// release wins — so dropping the guard lifts the pause at once instead of
+/// at the next keyboard event.
+struct RecordingPause {
+    held: AtomicBool,
+}
 
 impl RecordingPause {
     fn new() -> Self {
         RECORDING.fetch_add(1, Ordering::Relaxed);
-        RecordingPause
+        RecordingPause {
+            held: AtomicBool::new(true),
+        }
+    }
+
+    /// Lift the pause; a no-op if already released.
+    fn release(&self) {
+        if self.held.swap(false, Ordering::Relaxed) {
+            RECORDING.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 impl Drop for RecordingPause {
     fn drop(&mut self) {
-        RECORDING.fetch_sub(1, Ordering::Relaxed);
+        self.release();
     }
 }
 
@@ -324,8 +381,12 @@ mod tests {
         ev(key, KeyEventKind::Release, mods)
     }
 
+    /// Serializes tests touching the process-wide RECORDING count.
+    static RECORDING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pause_holds_the_count_for_its_lifetime() {
+        let _lock = RECORDING_TEST_LOCK.lock().unwrap();
         RECORDING.store(0, Ordering::Relaxed);
 
         {
@@ -335,11 +396,12 @@ mod tests {
         assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
 
         {
-            let mut pause = Some(RecordingPause::new());
+            let pause = RecordingPause::new();
             assert_eq!(RECORDING.load(Ordering::Relaxed), 1);
-            drop(pause.take()); // Released early, as at gesture end.
+            pause.release(); // Released early, as at gesture end.
+            pause.release(); // Idempotent: the second release is a no-op.
             assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
-            drop(pause); // Nothing left to release.
+            drop(pause); // Drop after release: no double decrement.
         }
         assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
     }
@@ -645,5 +707,51 @@ mod tests {
             step.events,
             vec![recorded(Hotkey::new(Modifiers::SUPER, Some(Key::KeyK)))]
         );
+    }
+
+    #[test]
+    fn recording_guard_drop_closes_the_channel_at_once() {
+        let _engine_lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
+        let _lock = RECORDING_TEST_LOCK.lock().unwrap();
+        RECORDING.store(0, Ordering::Relaxed);
+        let mut events = record();
+        let recording = events.guard().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done_tx.send(events.recv());
+        });
+        drop(recording);
+        // No keyboard event is needed — the close is receiver-side.
+        match done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Err(_)) => {}
+            other => panic!("expected a closed channel, got {other:?}"),
+        }
+        // Cancelling lifts the recording pause synchronously, not at the
+        // next keyboard event.
+        assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
+        // `done` only means the send ran; join so the worker's events (and
+        // its engine reference) are gone before the locks are released.
+        worker.join().unwrap();
+        // The worker held the last engine reference, so teardown has run:
+        // the tap-thread closure is gone and its pause hold was released
+        // exactly once — no double decrement.
+        assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropping_events_with_guard_alive_releases_the_pause() {
+        let _engine_lock = crate::ENGINE_TEST_LOCK.lock().unwrap();
+        let _lock = RECORDING_TEST_LOCK.lock().unwrap();
+        RECORDING.store(0, Ordering::Relaxed);
+        let mut events = record();
+        let recording = events.guard().unwrap();
+        assert_eq!(RECORDING.load(Ordering::Relaxed), 1);
+        // Dropping the stream cancels the session: the pause lifts at once,
+        // even though the Recording guard is still alive.
+        drop(events);
+        assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
+        // The guard's own release is now an idempotent no-op.
+        drop(recording);
+        assert_eq!(RECORDING.load(Ordering::Relaxed), 0);
     }
 }

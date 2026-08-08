@@ -21,7 +21,9 @@ pub(crate) struct CancelToken {
     _signal: Sender<()>,
 }
 
-/// The observing half of a cancellation signal.
+/// The observing half of a cancellation signal. Clones all observe the same
+/// signal: cancellation reaches every watcher.
+#[derive(Clone)]
 pub(crate) struct CancelWatcher(Receiver<()>);
 
 impl CancelWatcher {
@@ -29,11 +31,25 @@ impl CancelWatcher {
     pub(crate) fn is_cancelled(&self) -> bool {
         matches!(self.0.try_recv(), Err(channel::TryRecvError::Disconnected))
     }
+
+    /// The underlying receiver, for `select!` arms.
+    pub(crate) fn as_receiver(&self) -> &Receiver<()> {
+        &self.0
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clones_all_see_the_cancellation() {
+        let (token, w1) = cancel_token();
+        let w2 = w1.clone();
+        assert!(!w1.is_cancelled() && !w2.is_cancelled());
+        drop(token);
+        assert!(w1.is_cancelled() && w2.is_cancelled());
+    }
 
     #[test]
     fn watcher_flips_only_when_token_drops() {

@@ -216,15 +216,6 @@ pub enum RecvTimeoutError {
     Closed,
 }
 
-impl RecvTimeoutError {
-    pub(crate) fn from_channel_error(e: crossbeam_channel::RecvTimeoutError) -> Self {
-        match e {
-            crossbeam_channel::RecvTimeoutError::Timeout => Self::Timeout,
-            crossbeam_channel::RecvTimeoutError::Disconnected => Self::Closed,
-        }
-    }
-}
-
 impl fmt::Display for RecvTimeoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
