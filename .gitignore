@@ -6,3 +6,4 @@ scripts/
 
 docs/
 logs/
+.DS_Store

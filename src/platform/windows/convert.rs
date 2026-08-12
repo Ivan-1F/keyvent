@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use super::keycode::{self, Keycode};
+use crate::suppress::Suppression;
 use crate::{KeyEvent, KeyEventKind, Modifiers};
 
 /// Tracks held keys across events to synthesize the snapshot and the repeat
@@ -97,10 +98,39 @@ impl Tracker {
     }
 }
 
+/// Held-state judgment for reconcile: a key with an in-flight swallowed press
+/// cycle never reaches the OS key-state table (a swallowed event does not mark
+/// it), so the physical query reports it up for the entire hold and the event
+/// stream is its only truth. Everything else defers to the query. A swallowed
+/// cycle whose release is missed stays open until the key's next observed
+/// release — the query cannot tell that case from a live hold.
+pub(crate) fn reconcile_held(
+    suppression: &Suppression,
+    code: Keycode,
+    query: impl Fn(Keycode) -> bool,
+) -> bool {
+    suppression.is_tracking(code) || query(code)
+}
+
+/// Reconcile tracked presses against held state before one raw event is
+/// converted; returns the stale keycodes to close with synthetic releases.
+/// The event's own release is exempt from judgment (see [`Tracker::reconcile`]).
+pub(crate) fn reconcile_before_convert(
+    tracker: &mut Tracker,
+    suppression: &Suppression,
+    code: Keycode,
+    down: bool,
+    query: impl Fn(Keycode) -> bool,
+) -> Vec<Keycode> {
+    let skip = (!down).then_some(code);
+    tracker.reconcile(|c| reconcile_held(suppression, c, &query), skip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Key;
+    use crate::suppress::Action;
 
     fn ev(key: Key, kind: KeyEventKind, mods: Modifiers, is_repeat: bool) -> KeyEvent {
         KeyEvent {
@@ -257,6 +287,75 @@ mod tests {
         assert!(t.reconcile(|_| false, Some(0x1E)).is_empty());
         let e = t.convert(0x1E, false).unwrap();
         assert_eq!(e.kind, KeyEventKind::Release);
+    }
+
+    #[test]
+    fn repress_after_missed_release_closes_the_old_cycle() {
+        let mut t = Tracker::default();
+        let s = Suppression::default();
+        t.convert(0x1E, true).unwrap();
+        // The release was missed; the re-press arrives while the key-state
+        // table still reads up (hooks run ahead of the async state update).
+        let stale = reconcile_before_convert(&mut t, &s, 0x1E, true, |_| false);
+        assert_eq!(stale, vec![0x1E]);
+        // ...so the new press is a fresh cycle, not a repeat of the dead one.
+        let e = t.convert(0x1E, true).unwrap();
+        assert_eq!(e.kind, KeyEventKind::Press);
+        assert!(!e.is_repeat);
+    }
+
+    #[test]
+    fn swallowed_hold_survives_unrelated_events_and_repeats() {
+        let mut t = Tracker::default();
+        let mut s = Suppression::default();
+        // A's press is swallowed: the OS key-state table never sees it, so
+        // the physical query reports up for the entire hold.
+        s.press(0x1E, false, true);
+        t.convert(0x1E, true).unwrap();
+        // An unrelated press mid-hold must not condemn the swallowed key.
+        let stale = reconcile_before_convert(&mut t, &s, 0x20, true, |_| false);
+        assert!(stale.is_empty());
+        // A's auto-repeat is reconciled to nothing and stays a repeat.
+        let stale = reconcile_before_convert(&mut t, &s, 0x1E, true, |_| false);
+        assert!(stale.is_empty());
+        assert!(t.convert(0x1E, true).unwrap().is_repeat);
+        // The real release closes the cycle.
+        let stale = reconcile_before_convert(&mut t, &s, 0x1E, false, |_| false);
+        assert!(stale.is_empty());
+        assert_eq!(t.convert(0x1E, false).unwrap().kind, KeyEventKind::Release);
+    }
+
+    #[test]
+    fn passed_cycles_stay_query_judged() {
+        let mut t = Tracker::default();
+        let mut s = Suppression::default();
+        s.press(0x1E, false, false);
+        t.convert(0x1E, true).unwrap();
+        // The query reports A up (its release was missed): a passed cycle is
+        // still closed by reconcile on the next unrelated event.
+        let stale = reconcile_before_convert(&mut t, &s, 0x20, true, |_| false);
+        assert_eq!(stale, vec![0x1E]);
+    }
+
+    #[test]
+    fn swallowed_cycle_with_missed_release_closes_on_next_observed_release() {
+        let mut t = Tracker::default();
+        let mut s = Suppression::default();
+        s.press(0x1E, false, true);
+        t.convert(0x1E, true).unwrap();
+        // The release is missed (secure desktop). The query cannot see a
+        // swallowed key either way, so unrelated events must not close it.
+        let stale = reconcile_before_convert(&mut t, &s, 0x20, true, |_| false);
+        assert!(stale.is_empty());
+        // A re-press before the next observed release reads as a repeat of
+        // the still-open cycle, not a fresh press.
+        let stale = reconcile_before_convert(&mut t, &s, 0x1E, true, |_| false);
+        assert!(stale.is_empty());
+        assert!(t.convert(0x1E, true).unwrap().is_repeat);
+        // The next observed release closes every ledger.
+        assert_eq!(t.convert(0x1E, false).unwrap().kind, KeyEventKind::Release);
+        assert_eq!(s.release(0x1E), Action::Swallow);
+        assert!(!s.is_tracking(0x1E));
     }
 
     #[test]

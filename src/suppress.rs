@@ -136,8 +136,10 @@ impl Suppression {
             && (self.swallowed_presses.contains(&FN_KEYCODE) || self.globe_armed)
     }
 
-    #[cfg(test)]
-    fn is_tracking(&self, code: Keycode) -> bool {
+    /// Whether a swallowed press cycle is in flight for the keycode (press
+    /// booked, release not yet booked).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn is_tracking(&self, code: Keycode) -> bool {
         self.swallowed_presses.contains(&code)
     }
 }

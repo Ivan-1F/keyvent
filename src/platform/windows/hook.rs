@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WM_USER,
 };
 
-use super::convert::Tracker;
+use super::convert::{self, Tracker};
 use super::keycode::{self, Keycode};
 use crate::Status;
 use crate::dispatcher::BoxedCallback;
@@ -133,8 +133,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let code = keycode::encode(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0);
             // Close keys whose release was missed (secure desktop, skipped
             // events) before converting the new event.
-            let skip = (!down).then_some(code);
-            for stale in ctx.tracker.reconcile(is_queryable_held, skip) {
+            for stale in convert::reconcile_before_convert(
+                &mut ctx.tracker,
+                &ctx.suppression,
+                code,
+                down,
+                is_queryable_held,
+            ) {
                 let event =
                     route::synthetic_release(keycode::key_from_code(stale), ctx.tracker.snapshot());
                 route::route(
@@ -173,10 +178,11 @@ fn is_physically_held(code: Keycode) -> bool {
     unsafe { (GetAsyncKeyState(vk_of(code)) as u16) & 0x8000 != 0 }
 }
 
-/// Physical held-state query for reconcile; keys with no VK mapping report as
-/// held — they cannot be verified, so the event stream stays their truth.
+/// Physical held-state query for reconcile; keys with no VK mapping cannot be
+/// verified and report as not held, so reconcile closes them at the next event.
 fn is_queryable_held(code: Keycode) -> bool {
-    vk_of(code) != 0 && is_physically_held(code)
+    let vk = vk_of(code);
+    vk != 0 && unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
 }
 
 /// The virtual-key code a keycode's state is reported under. MAPVK_VSC_TO_VK_EX
