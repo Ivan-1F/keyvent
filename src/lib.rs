@@ -179,8 +179,9 @@ pub struct Guard {
 ///
 /// ## Callback
 ///
-/// The `callback` receives every keyboard event and returns whether to suppress
-/// it system-wide.
+/// The `callback` receives every key event and returns whether to suppress
+/// it system-wide. The macOS system action echoes carry no key activity
+/// and are not delivered.
 ///
 /// The callback runs on the event-tap thread, on the critical path of every
 /// keystroke. It **must return quickly**: no blocking, no locking contended
@@ -196,7 +197,7 @@ pub struct Guard {
 /// Releases always follow what the press did, so the OS can never be left with
 /// a phantom release or a stuck key.
 ///
-/// On macOS the decision does not apply to Caps Lock events; see
+/// On macOS the decision does not apply to the physical Caps Lock key; see
 /// [`hotkey::Suppression`].
 ///
 /// ## Platform Caveats

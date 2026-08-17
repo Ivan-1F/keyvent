@@ -2,12 +2,12 @@
 //!
 //! Caps Lock is delivered as a momentary key: its FlagsChanged events
 //! (keycode 57) signal the lock state toggling and do not carry the
-//! physical release, so each one is a Press immediately followed by a
-//! synthesized Release — tap semantics; holding is not representable in
-//! this stream, and one physical tap may produce more than one pair on
-//! some system paths. Keycode 255 (the system's caps-lock action echo)
-//! delivers nothing. Raw caps events pass to the OS unsuppressed (see
-//! [`crate::hotkey::Suppression`]).
+//! physical release, so each one arrives as a Press immediately followed
+//! by a synthesized Release — tap semantics for the physical key, whose
+//! hold is not representable in this stream; one physical tap may produce
+//! more than one pair on some system paths. The system action echoes are
+//! not physical keys (see [`convert`]). Raw caps events pass to the OS
+//! unsuppressed (see [`crate::hotkey::Suppression`]).
 //!
 //! Threading model:
 //! - The tap thread is the ONLY thread that runs the event-tap callback, so all

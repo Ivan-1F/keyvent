@@ -8,7 +8,10 @@
 //! - The snapshot is side-agnostic (the OS does not report sides in event
 //!   flags); side information is carried by [`KeyEvent::key`] itself, e.g. a
 //!   `Press` of [`Key::ShiftLeft`].
-//! - Unmapped keycodes are preserved as [`Key::Unknown`] instead of dropped.
+//! - Unmapped keycodes are preserved as [`Key::Unknown`] instead of dropped
+//!   — except the macOS system action echoes (keycodes 179 and 255), which
+//!   are not key activity and are dropped; registering one as a hotkey
+//!   matches nothing.
 
 use std::error::Error;
 use std::fmt;

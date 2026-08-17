@@ -8,8 +8,9 @@ use crate::suppress::{Action, Suppression};
 use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
 
 /// Run one event past the pairing ledger and dispatch what it allows to the
-/// callback. Returns the callback's swallow decision for a press, `false`
-/// for a release (releases never consult the callback).
+/// callback. Returns the callback's swallow decision for a press; a release
+/// is dispatched too, but its return value is ignored and this returns
+/// `false`.
 fn pair_and_dispatch(
     pairing: &mut Pairing,
     callback: &mut BoxedCallback,
@@ -56,8 +57,9 @@ pub(crate) fn route(
         }
         KeyEventKind::Release => {
             pair_and_dispatch(pairing, callback, code, event, snapshot);
-            // The release's swallow decision is derived from the press
-            // (see Suppression); the callback is not consulted.
+            // The release reaches the callback like any event; only its
+            // swallow decision is derived from the press (see Suppression)
+            // instead of being consulted.
             suppression.release(code)
         }
     }

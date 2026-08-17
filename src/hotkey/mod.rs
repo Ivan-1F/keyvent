@@ -187,8 +187,9 @@ fn modifier_bit_of(key: Key) -> Option<Modifiers> {
 
 /// Whether a swallowed hotkey's events are hidden from other applications.
 ///
-/// On macOS, `Swallow` has no effect on Caps Lock hotkeys: the key's OS
-/// action (input-source switch or lock toggle) still fires.
+/// On macOS, `Swallow` has no effect on the physical Caps Lock key: its OS
+/// action (input-source switch or lock toggle) still fires. Synthetic Caps
+/// Lock key events posted by other apps are ordinary keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Suppression {
     /// Events forming the hotkey never reach other apps.
