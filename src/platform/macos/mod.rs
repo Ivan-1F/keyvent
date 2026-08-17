@@ -20,7 +20,7 @@
 //!   what keeps a wedged callback from freezing the keyboard.
 
 mod convert;
-mod keycode;
+pub(crate) mod keycode;
 pub(crate) mod supervisor;
 
 pub(crate) use supervisor::Supervisor;
@@ -43,8 +43,8 @@ use objc2_core_graphics::{
 };
 
 use self::keycode::{CAPS_LOCK, Keycode};
+use crate::Modifiers;
 use crate::dispatcher::BoxedCallback;
-use crate::{Key, Modifiers};
 
 use crate::pairing::Pairing;
 use crate::route;
@@ -419,42 +419,38 @@ unsafe extern "C-unwind" fn raw_callback(
         return null_mut();
     }
 
-    let Some(key_event) = convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind)
-    else {
-        return event.as_ptr();
-    };
-
-    if kind == RawKind::FlagsChanged && keycode == CAPS_LOCK {
-        // Momentary caps: the Press and its paired Release, back to back;
-        // the pair shares the event's own modifier snapshot.
-        let modifiers = key_event.modifiers;
-        route::route_observe(
-            &mut ctx.pairing,
-            &mut ctx.callback,
-            CAPS_LOCK,
-            key_event,
-            current_modifier_snapshot,
-        );
-        let release = route::synthetic_release(Key::CapsLock, modifiers);
-        route::route_observe(
-            &mut ctx.pairing,
-            &mut ctx.callback,
-            CAPS_LOCK,
-            release,
-            current_modifier_snapshot,
-        );
-        return event.as_ptr();
-    }
-
-    match route::route(
-        &mut ctx.pairing,
-        &mut ctx.suppression,
-        &mut ctx.callback,
-        keycode,
-        key_event,
-        current_modifier_snapshot,
-    ) {
-        Action::Swallow => null_mut(),
-        Action::Pass => event.as_ptr(),
+    match convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind) {
+        convert::Converted::None => event.as_ptr(),
+        convert::Converted::Pair(press, release) => {
+            // Momentary caps pair; the raw event passes unsuppressed.
+            route::route_observe(
+                &mut ctx.pairing,
+                &mut ctx.callback,
+                keycode,
+                press,
+                current_modifier_snapshot,
+            );
+            route::route_observe(
+                &mut ctx.pairing,
+                &mut ctx.callback,
+                keycode,
+                release,
+                current_modifier_snapshot,
+            );
+            event.as_ptr()
+        }
+        convert::Converted::One(key_event) => {
+            match route::route(
+                &mut ctx.pairing,
+                &mut ctx.suppression,
+                &mut ctx.callback,
+                keycode,
+                key_event,
+                current_modifier_snapshot,
+            ) {
+                Action::Swallow => null_mut(),
+                Action::Pass => event.as_ptr(),
+            }
+        }
     }
 }

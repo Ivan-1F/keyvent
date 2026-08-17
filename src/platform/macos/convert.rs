@@ -19,13 +19,12 @@
 //! and deliver nothing.
 
 use super::keycode::{self, Keycode};
-use crate::suppress::GLOBE_ACTION_KEYCODE;
 use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
 
 /// True for the system action echoes trailing the Fn and Caps Lock keys:
 /// synthesized by the OS to trigger an action, not physical key activity.
 fn is_action_echo(keycode: Keycode) -> bool {
-    keycode == keycode::CAPS_ACTION_ECHO || keycode == GLOBE_ACTION_KEYCODE
+    keycode == keycode::CAPS_ACTION_ECHO || keycode == keycode::GLOBE_ACTION_KEYCODE
 }
 
 /// Side-specific held state for the eight modifier keys.
@@ -185,9 +184,20 @@ const fn press_if(held: bool) -> KeyEventKind {
     }
 }
 
-/// Convert one raw event into a uniform [`KeyEvent`], or `None` when the
-/// event carries no key activity (the caps-lock action echo): the tracker
-/// is updated either way.
+/// What one raw event converts into for delivery. The tracker is updated
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Converted {
+    /// No key activity to deliver (the system action echoes).
+    None,
+    /// One event.
+    One(KeyEvent),
+    /// A momentary pair, press then release (Caps Lock; both carry the
+    /// event's own modifier snapshot).
+    Pair(KeyEvent, KeyEvent),
+}
+
+/// Convert one raw event into a [`Converted`].
 ///
 /// Pure with respect to the OS: all OS facts (keycode, flags, autorepeat) are
 /// passed in, so the logic is unit-testable without FFI.
@@ -197,12 +207,15 @@ pub(crate) fn convert(
     snapshot: Modifiers,
     tracker: &mut ModifierTracker,
     kind_of_event: RawKind,
-) -> Option<KeyEvent> {
+) -> Converted {
     let key = keycode::key_from_code(keycode);
     match kind_of_event {
         RawKind::Down => {
             tracker.reconcile(snapshot, None);
-            (!is_action_echo(keycode)).then_some(KeyEvent {
+            if is_action_echo(keycode) {
+                return Converted::None;
+            }
+            Converted::One(KeyEvent {
                 key,
                 kind: KeyEventKind::Press,
                 modifiers: snapshot,
@@ -211,7 +224,10 @@ pub(crate) fn convert(
         }
         RawKind::Up => {
             tracker.reconcile(snapshot, None);
-            (!is_action_echo(keycode)).then_some(KeyEvent {
+            if is_action_echo(keycode) {
+                return Converted::None;
+            }
+            Converted::One(KeyEvent {
                 key,
                 kind: KeyEventKind::Release,
                 modifiers: snapshot,
@@ -221,20 +237,27 @@ pub(crate) fn convert(
         RawKind::FlagsChanged => {
             if is_action_echo(keycode) {
                 tracker.reconcile(snapshot, None);
-                return None;
+                return Converted::None;
             }
             if keycode == keycode::CAPS_LOCK {
-                // Momentary: a caps FlagsChanged is one physical tap; the
-                // paired Release is appended by the caller.
+                // Momentary: a caps FlagsChanged is one physical tap.
                 tracker.reconcile(snapshot, None);
-                return Some(KeyEvent {
-                    key,
-                    kind: KeyEventKind::Press,
-                    modifiers: snapshot,
-                    is_repeat: false,
-                });
+                return Converted::Pair(
+                    KeyEvent {
+                        key,
+                        kind: KeyEventKind::Press,
+                        modifiers: snapshot,
+                        is_repeat: false,
+                    },
+                    KeyEvent {
+                        key,
+                        kind: KeyEventKind::Release,
+                        modifiers: snapshot,
+                        is_repeat: false,
+                    },
+                );
             }
-            Some(tracker.flags_changed(key, snapshot))
+            Converted::One(tracker.flags_changed(key, snapshot))
         }
     }
 }
@@ -260,7 +283,7 @@ mod tests {
         }
     }
 
-    /// Unwraps the converted event; every call here expects delivery.
+    /// Unwraps the converted event; every call here expects a single event.
     fn conv(
         keycode: Keycode,
         is_repeat: bool,
@@ -268,7 +291,10 @@ mod tests {
         t: &mut ModifierTracker,
         kind: RawKind,
     ) -> KeyEvent {
-        convert(keycode, is_repeat, mods, t, kind).unwrap()
+        let Converted::One(event) = convert(keycode, is_repeat, mods, t, kind) else {
+            panic!("expected Converted::One")
+        };
+        event
     }
 
     #[test]
@@ -361,15 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn caps_lock_flags_changed_is_a_momentary_press_and_heals_tracker() {
+    fn caps_lock_flags_changed_is_a_momentary_pair_and_heals_tracker() {
         let mut t = ModifierTracker::default();
         // ShiftLeft pressed, its release LOST (tap timeout): tracker holds a phantom.
         let _ = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
-        // A caps FlagsChanged is a momentary Press, and it updates the
-        // tracker like any event.
+        // A caps FlagsChanged converts to a momentary pair, and it updates
+        // the tracker like any event.
         assert_eq!(
             convert(57, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
-            Some(ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE))
+            Converted::Pair(
+                ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE),
+                ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE),
+            )
         );
         // Phantom healed: the next ShiftLeft press is a Press again, not an
         // inverted Release.
@@ -379,28 +408,40 @@ mod tests {
     }
 
     #[test]
+    fn caps_lock_pair_shares_the_event_snapshot() {
+        let mut t = ModifierTracker::default();
+        assert_eq!(
+            convert(57, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged),
+            Converted::Pair(
+                ev(Key::CapsLock, KeyEventKind::Press, Modifiers::SHIFT),
+                ev(Key::CapsLock, KeyEventKind::Release, Modifiers::SHIFT),
+            )
+        );
+    }
+
+    #[test]
     fn caps_action_echo_delivers_nothing_in_any_raw_form() {
         let mut t = ModifierTracker::default();
         assert_eq!(
             convert(255, false, Modifiers::NONE, &mut t, RawKind::Down),
-            None
+            Converted::None
         );
         assert_eq!(
             convert(255, false, Modifiers::NONE, &mut t, RawKind::Up),
-            None
+            Converted::None
         );
         assert_eq!(
             convert(255, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
-            None
+            Converted::None
         );
         // Posted synthetic Caps Lock key events (e.g. from remappers) still flow.
         assert_eq!(
             convert(57, false, Modifiers::NONE, &mut t, RawKind::Down),
-            Some(ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE))
+            Converted::One(ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE))
         );
         assert_eq!(
             convert(57, false, Modifiers::NONE, &mut t, RawKind::Up),
-            Some(ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE))
+            Converted::One(ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE))
         );
     }
 
@@ -411,15 +452,15 @@ mod tests {
         // swallowed or not.
         assert_eq!(
             convert(179, false, Modifiers::NONE, &mut t, RawKind::Down),
-            None
+            Converted::None
         );
         assert_eq!(
             convert(179, false, Modifiers::NONE, &mut t, RawKind::Up),
-            None
+            Converted::None
         );
         assert_eq!(
             convert(179, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
-            None
+            Converted::None
         );
     }
 }

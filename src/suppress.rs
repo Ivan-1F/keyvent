@@ -23,17 +23,8 @@
 use std::collections::HashSet;
 
 use crate::platform::Keycode;
-
-/// The Fn/Globe key's keycode.
 #[cfg(target_os = "macos")]
-pub(crate) const FN_KEYCODE: Keycode = 63;
-/// Keycode of the synthesized event macOS emits on Fn release to trigger the
-/// system "Press 🌐 key to" action (emoji panel, input-source switch, …).
-/// It TRAILS the Fn-release FlagsChanged in the event stream, so by the time
-/// it arrives the Fn press bookkeeping is already closed; the swallowed
-/// cycle's decision is carried forward by `globe_armed`.
-#[cfg(target_os = "macos")]
-pub(crate) const GLOBE_ACTION_KEYCODE: Keycode = 179;
+use crate::platform::macos::keycode::{FN_KEYCODE, GLOBE_ACTION_KEYCODE};
 
 /// What to do with the raw OS event after bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

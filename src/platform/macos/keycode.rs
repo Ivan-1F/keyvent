@@ -13,6 +13,11 @@ pub(crate) const CAPS_LOCK: Keycode = 57;
 /// Keycode of the action echo macOS emits around the caps-lock action
 /// (input-source switch / lock engage). Not a physical key.
 pub(crate) const CAPS_ACTION_ECHO: Keycode = 255;
+/// The Fn/Globe key's keycode.
+pub(crate) const FN_KEYCODE: Keycode = 63;
+/// Keycode of the action echo macOS emits on Fn release to trigger the
+/// system "Press 🌐 key to" action. Not a physical key.
+pub(crate) const GLOBE_ACTION_KEYCODE: Keycode = 179;
 
 pub fn key_from_code(code: Keycode) -> Key {
     match code {
