@@ -1,5 +1,14 @@
 //! The tap thread: owns the CGEventTap and its CFRunLoop.
 //!
+//! Caps Lock is delivered as a momentary key: its FlagsChanged events
+//! (keycode 57) signal the lock state toggling and do not carry the
+//! physical release, so each one is a Press immediately followed by a
+//! synthesized Release — tap semantics; holding is not representable in
+//! this stream, and one physical tap may produce more than one pair on
+//! some system paths. Keycode 255 (the system's caps-lock action echo)
+//! delivers nothing. Raw caps events pass to the OS unsuppressed (see
+//! [`crate::hotkey::Suppression`]).
+//!
 //! Threading model:
 //! - The tap thread is the ONLY thread that runs the event-tap callback, so all
 //!   conversion/tracking/suppression state is lock-free thread-local data.
@@ -33,9 +42,9 @@ use objc2_core_graphics::{
     CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
 
-use self::keycode::Keycode;
-use crate::Modifiers;
+use self::keycode::{CAPS_LOCK, Keycode};
 use crate::dispatcher::BoxedCallback;
+use crate::{Key, Modifiers};
 
 use crate::pairing::Pairing;
 use crate::route;
@@ -309,11 +318,17 @@ fn drop_local_tap(ctx: &mut Ctx) {
 /// presses whose key is physically up are closed with synthetic releases,
 /// while keys still held stay open and close on their real release.
 fn reconcile_books(ctx: &mut Ctx) {
+    // key_state reports the lock state for Caps Lock, not the physical key,
+    // so it cannot verify a caps entry. Physical caps taps close atomically
+    // (press and release dispatch back to back), so a dangling caps entry is
+    // always a posted event whose release was lost: close it.
     ctx.suppression.reconcile(|code| {
-        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+        code != CAPS_LOCK
+            && CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
     });
     let released = ctx.pairing.reconcile(|code| {
-        CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+        code != CAPS_LOCK
+            && CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
     });
     emit_synthetic_releases(ctx, released);
 }
@@ -398,21 +413,38 @@ unsafe extern "C-unwind" fn raw_callback(
         && CGEvent::integer_value_field(Some(cg), CGEventField::KeyboardEventAutorepeat) != 0;
     let flags = CGEvent::flags(Some(cg));
     let snapshot = modifiers_from_cg(flags);
-    let caps_lock = flags.contains(CGEventFlags::MaskAlphaShift);
 
     // Swallow the globe-action event when its Fn cycle is being suppressed.
     if ctx.suppression.swallows_globe_action(keycode) {
         return null_mut();
     }
 
-    let key_event = convert::convert(
-        keycode,
-        is_repeat,
-        snapshot,
-        caps_lock,
-        &mut ctx.tracker,
-        kind,
-    );
+    let Some(key_event) = convert::convert(keycode, is_repeat, snapshot, &mut ctx.tracker, kind)
+    else {
+        return event.as_ptr();
+    };
+
+    if kind == RawKind::FlagsChanged && keycode == CAPS_LOCK {
+        // Momentary caps: the Press and its paired Release, back to back;
+        // the pair shares the event's own modifier snapshot.
+        let modifiers = key_event.modifiers;
+        route::route_observe(
+            &mut ctx.pairing,
+            &mut ctx.callback,
+            CAPS_LOCK,
+            key_event,
+            current_modifier_snapshot,
+        );
+        let release = route::synthetic_release(Key::CapsLock, modifiers);
+        route::route_observe(
+            &mut ctx.pairing,
+            &mut ctx.callback,
+            CAPS_LOCK,
+            release,
+            current_modifier_snapshot,
+        );
+        return event.as_ptr();
+    }
 
     match route::route(
         &mut ctx.pairing,

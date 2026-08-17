@@ -10,12 +10,23 @@
 //!   events);
 //! - aggregate bit set but no side tracked -> fall back to the left side.
 //!
-//! Caps Lock and Fn need no tracking: their flags are not shared between
-//! keys, so press/release is read from the flag directly — Fn from the
-//! snapshot, Caps Lock from `caps_lock`.
+//! Fn needs no tracking: its flag is not shared with any other key, so
+//! press/release is read from the snapshot directly. Caps Lock is a
+//! momentary key: its FlagsChanged events signal the lock state toggling
+//! rather than a physical press/release pair, so each one converts to a
+//! single Press (the Release is synthesized right after by the caller).
+//! The system action echoes (keycodes 255 and 179) are not physical keys
+//! and deliver nothing.
 
 use super::keycode::{self, Keycode};
+use crate::suppress::GLOBE_ACTION_KEYCODE;
 use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
+
+/// True for the system action echoes trailing the Fn and Caps Lock keys:
+/// synthesized by the OS to trigger an action, not physical key activity.
+fn is_action_echo(keycode: Keycode) -> bool {
+    keycode == keycode::CAPS_ACTION_ECHO || keycode == GLOBE_ACTION_KEYCODE
+}
 
 /// Side-specific held state for the eight modifier keys.
 #[derive(Default, Debug, Clone, Copy)]
@@ -68,15 +79,9 @@ pub(crate) struct ModifierTracker {
 impl ModifierTracker {
     /// Handle a `FlagsChanged` event. Consumes the keycode + snapshot and
     /// produces the uniform Press/Release event.
-    pub(crate) fn flags_changed(
-        &mut self,
-        key: Key,
-        snapshot: Modifiers,
-        caps_lock: bool,
-    ) -> KeyEvent {
+    pub(crate) fn flags_changed(&mut self, key: Key, snapshot: Modifiers) -> KeyEvent {
         let kind = match key {
-            // Stateless keys: their flag bit is not shared with any other key.
-            Key::CapsLock => press_if(caps_lock),
+            // Stateless key: its flag bit is not shared with any other key.
             Key::Function => press_if(snapshot.contains(Modifiers::FN)),
             _ => match side_of(key) {
                 Some((side, group)) => {
@@ -180,7 +185,9 @@ const fn press_if(held: bool) -> KeyEventKind {
     }
 }
 
-/// Convert one raw event into a uniform [`KeyEvent`].
+/// Convert one raw event into a uniform [`KeyEvent`], or `None` when the
+/// event carries no key activity (the caps-lock action echo): the tracker
+/// is updated either way.
 ///
 /// Pure with respect to the OS: all OS facts (keycode, flags, autorepeat) are
 /// passed in, so the logic is unit-testable without FFI.
@@ -188,31 +195,47 @@ pub(crate) fn convert(
     keycode: Keycode,
     is_repeat: bool,
     snapshot: Modifiers,
-    caps_lock: bool,
     tracker: &mut ModifierTracker,
     kind_of_event: RawKind,
-) -> KeyEvent {
+) -> Option<KeyEvent> {
     let key = keycode::key_from_code(keycode);
     match kind_of_event {
         RawKind::Down => {
             tracker.reconcile(snapshot, None);
-            KeyEvent {
+            (!is_action_echo(keycode)).then_some(KeyEvent {
                 key,
                 kind: KeyEventKind::Press,
                 modifiers: snapshot,
                 is_repeat,
-            }
+            })
         }
         RawKind::Up => {
             tracker.reconcile(snapshot, None);
-            KeyEvent {
+            (!is_action_echo(keycode)).then_some(KeyEvent {
                 key,
                 kind: KeyEventKind::Release,
                 modifiers: snapshot,
                 is_repeat: false,
-            }
+            })
         }
-        RawKind::FlagsChanged => tracker.flags_changed(key, snapshot, caps_lock),
+        RawKind::FlagsChanged => {
+            if is_action_echo(keycode) {
+                tracker.reconcile(snapshot, None);
+                return None;
+            }
+            if keycode == keycode::CAPS_LOCK {
+                // Momentary: a caps FlagsChanged is one physical tap; the
+                // paired Release is appended by the caller.
+                tracker.reconcile(snapshot, None);
+                return Some(KeyEvent {
+                    key,
+                    kind: KeyEventKind::Press,
+                    modifiers: snapshot,
+                    is_repeat: false,
+                });
+            }
+            Some(tracker.flags_changed(key, snapshot))
+        }
     }
 }
 
@@ -237,37 +260,34 @@ mod tests {
         }
     }
 
+    /// Unwraps the converted event; every call here expects delivery.
+    fn conv(
+        keycode: Keycode,
+        is_repeat: bool,
+        mods: Modifiers,
+        t: &mut ModifierTracker,
+        kind: RawKind,
+    ) -> KeyEvent {
+        convert(keycode, is_repeat, mods, t, kind).unwrap()
+    }
+
     #[test]
     fn plain_key_events() {
         let mut t = ModifierTracker::default();
-        let down = convert(0, false, Modifiers::NONE, false, &mut t, RawKind::Down);
+        let down = conv(0, false, Modifiers::NONE, &mut t, RawKind::Down);
         assert_eq!(down, ev(Key::KeyA, KeyEventKind::Press, Modifiers::NONE));
-        let repeat = convert(0, true, Modifiers::NONE, false, &mut t, RawKind::Down);
+        let repeat = conv(0, true, Modifiers::NONE, &mut t, RawKind::Down);
         assert!(repeat.is_repeat);
-        let up = convert(0, false, Modifiers::NONE, false, &mut t, RawKind::Up);
+        let up = conv(0, false, Modifiers::NONE, &mut t, RawKind::Up);
         assert_eq!(up, ev(Key::KeyA, KeyEventKind::Release, Modifiers::NONE));
     }
 
     #[test]
     fn fn_press_release_from_flags() {
         let mut t = ModifierTracker::default();
-        let down = convert(
-            63,
-            false,
-            Modifiers::FN,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let down = conv(63, false, Modifiers::FN, &mut t, RawKind::FlagsChanged);
         assert_eq!(down, ev(Key::Function, KeyEventKind::Press, Modifiers::FN));
-        let up = convert(
-            63,
-            false,
-            Modifiers::NONE,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let up = conv(63, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(
             up,
             ev(Key::Function, KeyEventKind::Release, Modifiers::NONE)
@@ -278,47 +298,19 @@ mod tests {
     fn both_shifts_held_release_one() {
         let mut t = ModifierTracker::default();
         // Left shift down (aggregate SHIFT set).
-        let e = convert(
-            56,
-            false,
-            Modifiers::SHIFT,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
         assert_eq!(e.key, Key::ShiftLeft);
         // Right shift down while left held (aggregate still SHIFT).
-        let e = convert(
-            60,
-            false,
-            Modifiers::SHIFT,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(60, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
         assert_eq!(e.key, Key::ShiftRight);
         // Left released while right still held (aggregate STILL SHIFT).
-        let e = convert(
-            56,
-            false,
-            Modifiers::SHIFT,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Release);
         assert_eq!(e.key, Key::ShiftLeft);
         // Right released (aggregate clear).
-        let e = convert(
-            60,
-            false,
-            Modifiers::NONE,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(60, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Release);
         assert_eq!(e.key, Key::ShiftRight);
     }
@@ -327,26 +319,12 @@ mod tests {
     fn reconcile_clears_drift_from_missed_release() {
         let mut t = ModifierTracker::default();
         // ShiftLeft pressed.
-        let _ = convert(
-            56,
-            false,
-            Modifiers::SHIFT,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let _ = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         // Its release is LOST (e.g. tap timeout). Next plain event has SHIFT clear.
-        let _ = convert(0, false, Modifiers::NONE, false, &mut t, RawKind::Down);
+        let _ = conv(0, false, Modifiers::NONE, &mut t, RawKind::Down);
         // Tracker must have cleared: a subsequent ShiftLeft FlagsChanged is a Press
         // again.
-        let e = convert(
-            56,
-            false,
-            Modifiers::SHIFT,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
     }
 
@@ -354,32 +332,18 @@ mod tests {
     fn reconcile_assumes_left_for_missed_press() {
         let mut t = ModifierTracker::default();
         // First event ever seen already has SUPER held: press was missed.
-        let e = convert(0, false, Modifiers::SUPER, false, &mut t, RawKind::Down);
+        let e = conv(0, false, Modifiers::SUPER, &mut t, RawKind::Down);
         assert_eq!(e.modifiers, Modifiers::SUPER);
         // SuperRight release arrives with the aggregate CLEAR: the aggregate
         // rule determines this is a release (never a toggle-mislabeled press),
         // and the same event's reconcile clears the phantom SuperLeft that
         // assume-left had inserted. Tracker must not go negative or leak state.
-        let e = convert(
-            54,
-            false,
-            Modifiers::NONE,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(54, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.key, Key::SuperRight);
         assert_eq!(e.kind, KeyEventKind::Release);
         // Phantom state is gone: a subsequent SuperLeft FlagsChanged with the
         // aggregate set is inferred as a fresh press.
-        let e = convert(
-            55,
-            false,
-            Modifiers::SUPER,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(55, false, Modifiers::SUPER, &mut t, RawKind::FlagsChanged);
         assert_eq!(e.kind, KeyEventKind::Press);
     }
 
@@ -389,14 +353,7 @@ mod tests {
         // Tap installed while SuperLeft was held; its press is in the blind
         // zone. No assume-left has fired yet (no plain event seen).
         // The user releases it: aggregate clears -> deterministic Release.
-        let e = convert(
-            55,
-            false,
-            Modifiers::NONE,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
-        );
+        let e = conv(55, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged);
         assert_eq!(
             e,
             ev(Key::SuperLeft, KeyEventKind::Release, Modifiers::NONE)
@@ -404,28 +361,65 @@ mod tests {
     }
 
     #[test]
-    fn caps_lock_from_flags() {
+    fn caps_lock_flags_changed_is_a_momentary_press_and_heals_tracker() {
         let mut t = ModifierTracker::default();
-        let on = convert(
-            57,
-            false,
-            Modifiers::NONE,
-            true,
-            &mut t,
-            RawKind::FlagsChanged,
+        // ShiftLeft pressed, its release LOST (tap timeout): tracker holds a phantom.
+        let _ = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
+        // A caps FlagsChanged is a momentary Press, and it updates the
+        // tracker like any event.
+        assert_eq!(
+            convert(57, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
+            Some(ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE))
         );
-        assert_eq!(on, ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE));
-        let off = convert(
-            57,
-            false,
-            Modifiers::NONE,
-            false,
-            &mut t,
-            RawKind::FlagsChanged,
+        // Phantom healed: the next ShiftLeft press is a Press again, not an
+        // inverted Release.
+        let e = conv(56, false, Modifiers::SHIFT, &mut t, RawKind::FlagsChanged);
+        assert_eq!(e.kind, KeyEventKind::Press);
+        assert_eq!(e.key, Key::ShiftLeft);
+    }
+
+    #[test]
+    fn caps_action_echo_delivers_nothing_in_any_raw_form() {
+        let mut t = ModifierTracker::default();
+        assert_eq!(
+            convert(255, false, Modifiers::NONE, &mut t, RawKind::Down),
+            None
         );
         assert_eq!(
-            off,
-            ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE)
+            convert(255, false, Modifiers::NONE, &mut t, RawKind::Up),
+            None
+        );
+        assert_eq!(
+            convert(255, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
+            None
+        );
+        // Posted synthetic Caps Lock key events (e.g. from remappers) still flow.
+        assert_eq!(
+            convert(57, false, Modifiers::NONE, &mut t, RawKind::Down),
+            Some(ev(Key::CapsLock, KeyEventKind::Press, Modifiers::NONE))
+        );
+        assert_eq!(
+            convert(57, false, Modifiers::NONE, &mut t, RawKind::Up),
+            Some(ev(Key::CapsLock, KeyEventKind::Release, Modifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn fn_globe_action_delivers_nothing_in_any_raw_form() {
+        let mut t = ModifierTracker::default();
+        // The Fn key's action echo (179) is not a physical key either,
+        // swallowed or not.
+        assert_eq!(
+            convert(179, false, Modifiers::NONE, &mut t, RawKind::Down),
+            None
+        );
+        assert_eq!(
+            convert(179, false, Modifiers::NONE, &mut t, RawKind::Up),
+            None
+        );
+        assert_eq!(
+            convert(179, false, Modifiers::NONE, &mut t, RawKind::FlagsChanged),
+            None
         );
     }
 }

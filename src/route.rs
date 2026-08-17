@@ -7,6 +7,33 @@ use crate::platform::Keycode;
 use crate::suppress::{Action, Suppression};
 use crate::{Key, KeyEvent, KeyEventKind, Modifiers};
 
+/// Run one event past the pairing ledger and dispatch what it allows to the
+/// callback. Returns the callback's swallow decision for a press, `false`
+/// for a release (releases never consult the callback).
+fn pair_and_dispatch(
+    pairing: &mut Pairing,
+    callback: &mut BoxedCallback,
+    code: Keycode,
+    event: KeyEvent,
+    snapshot: impl Fn() -> Modifiers,
+) -> bool {
+    match event.kind {
+        KeyEventKind::Press => {
+            if pairing.press(code, event.is_repeat) == Plan::CloseThenDeliver {
+                // A previous release was lost: close the dangling press first.
+                dispatch(callback, synthetic_release(event.key, snapshot()));
+            }
+            dispatch(callback, event)
+        }
+        KeyEventKind::Release => {
+            if pairing.release(code) == Plan::Deliver {
+                dispatch(callback, event);
+            }
+            false
+        }
+    }
+}
+
 /// Run one converted event past [`Pairing`], the callback, and
 /// [`Suppression`]; returns whether the raw event passes to the OS.
 /// `snapshot` is called only when a synthetic release has to be emitted.
@@ -24,22 +51,30 @@ pub(crate) fn route(
     // but still passed through if the OS saw its press.
     match event.kind {
         KeyEventKind::Press => {
-            if pairing.press(code, event.is_repeat) == Plan::CloseThenDeliver {
-                // A previous release was lost: close the dangling press first.
-                dispatch(callback, synthetic_release(event.key, snapshot()));
-            }
-            let user_swallow = dispatch(callback, event);
+            let user_swallow = pair_and_dispatch(pairing, callback, code, event, snapshot);
             suppression.press(code, event.is_repeat, user_swallow)
         }
         KeyEventKind::Release => {
-            if pairing.release(code) == Plan::Deliver {
-                dispatch(callback, event);
-            }
+            pair_and_dispatch(pairing, callback, code, event, snapshot);
             // The release's swallow decision is derived from the press
             // (see Suppression); the callback is not consulted.
             suppression.release(code)
         }
     }
+}
+
+/// [`route`] without suppression bookkeeping, for events whose raw form is
+/// not swallowed (the macOS Caps Lock channel): a ledger entry there would
+/// record decisions nothing reads.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn route_observe(
+    pairing: &mut Pairing,
+    callback: &mut BoxedCallback,
+    code: Keycode,
+    event: KeyEvent,
+    snapshot: impl Fn() -> Modifiers,
+) {
+    pair_and_dispatch(pairing, callback, code, event, snapshot);
 }
 
 /// Dispatch one event to the callback. Last-resort boundary: the dispatcher
@@ -104,6 +139,38 @@ mod tests {
 
     fn recorded(seen: &Seen) -> Vec<KeyEvent> {
         seen.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn observe_delivers_pairs_and_drops_orphans() {
+        let (mut p, _s, mut cb, seen) = rig(true);
+        // The callback's swallow decision is ignored: nothing is booked.
+        route_observe(&mut p, &mut cb, 36, press(Key::Return), Modifiers::empty);
+        route_observe(&mut p, &mut cb, 36, release(Key::Return), Modifiers::empty);
+        assert_eq!(
+            recorded(&seen),
+            vec![press(Key::Return), release(Key::Return)]
+        );
+        // An orphan release is hidden from the consumer.
+        route_observe(&mut p, &mut cb, 36, release(Key::Return), Modifiers::empty);
+        assert_eq!(recorded(&seen).len(), 2);
+    }
+
+    #[test]
+    fn observe_repress_closes_dangling_press_first() {
+        let (mut p, _s, mut cb, seen) = rig(false);
+        route_observe(&mut p, &mut cb, 36, press(Key::Return), Modifiers::empty);
+        // The release was lost; the re-press first emits a synthetic release
+        // carrying the live snapshot's modifiers.
+        route_observe(&mut p, &mut cb, 36, press(Key::Return), || Modifiers::SHIFT);
+        assert_eq!(
+            recorded(&seen),
+            vec![
+                press(Key::Return),
+                synthetic_release(Key::Return, Modifiers::SHIFT),
+                press(Key::Return),
+            ]
+        );
     }
 
     #[test]

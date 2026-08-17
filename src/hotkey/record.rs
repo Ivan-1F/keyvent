@@ -12,8 +12,9 @@
 //!   (`{SUPER|SHIFT, None}`) — pressing both sides of a modifier is how the
 //!   side-agnostic group (`{ALT, None}`) is recorded.
 //! - Bare Esc cancels; every other key is recordable, including bare Delete.
-//! - All keyboard input is swallowed while recording, and every `on` guard
-//!   pauses matching; both end when the session ends.
+//! - All keyboard input is swallowed while recording — except Caps Lock on
+//!   macOS, which passes through (see [`Suppression`]) — and every `on`
+//!   guard pauses matching; both end when the session ends.
 
 use std::collections::HashSet;
 use std::sync::Arc;

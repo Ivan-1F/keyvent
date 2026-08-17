@@ -196,6 +196,9 @@ pub struct Guard {
 /// Releases always follow what the press did, so the OS can never be left with
 /// a phantom release or a stuck key.
 ///
+/// On macOS the decision does not apply to Caps Lock events; see
+/// [`hotkey::Suppression`].
+///
 /// ## Platform Caveats
 ///
 /// ### macOS

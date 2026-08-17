@@ -8,6 +8,12 @@ use crate::Key;
 
 pub(crate) use crate::platform::Keycode;
 
+/// Keycode of the Caps Lock key.
+pub(crate) const CAPS_LOCK: Keycode = 57;
+/// Keycode of the action echo macOS emits around the caps-lock action
+/// (input-source switch / lock engage). Not a physical key.
+pub(crate) const CAPS_ACTION_ECHO: Keycode = 255;
+
 pub fn key_from_code(code: Keycode) -> Key {
     match code {
         0 => Key::KeyA,
