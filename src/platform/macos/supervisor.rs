@@ -1,39 +1,14 @@
-//! The supervisor thread: owns the permission-lifecycle state machine.
+//! The supervisor thread: drives the [`Lifecycle`] state machine with real time and the real OS.
 //!
-//! Detection philosophy: never trust `AXIsProcessTrusted` or tap-disabled
-//! notifications — probe functionally, and only ever *observe* (keyvent
-//! injects nothing into the OS event stream):
-//!
-//! - **tap_create probe** (every 1s): ground truth for "can this process filter
-//!   keyboard events right now". NULL = no. Drives both revocation (teardown)
-//!   and re-grant (rebuild).
-//! - **tap_is_enabled** (every tick): detects a watchdog-disabled or otherwise
-//!   dead tap that the disabled-notification path missed.
-//! - **kCGEventTapDisabledByUserInput**: administrative disable hint (unreliable
-//!   on revocation, free to act on when it does arrive).
-//!
-//! The state machine has exactly two states. Every anomaly takes the same
-//! safe-direction path — force_invalidate + teardown into Silent — and
-//! Silent's ordinary probing brings the tap back when conditions allow:
-//!
-//! ```text
-//! Running --any anomaly--> force_invalidate + Teardown --> Silent
-//! Silent  --probe OK & install succeeds--> Running
-//! ```
-//!
-//! There is deliberately no cooldown/budget machinery: the loop is rate-limited
-//! by PROBE_INTERVAL, every pass goes through a tap-free (input-safe) state,
-//! and a rebuild costs no more than the probe that already runs every second.
-//! The escape hatch for a hypothetical poisonous-callback loop is the existing
-//! `timeouts` counter, documented in docs/design.md.
+//! The thread sleeps until something happens: a TCC notification, shutdown, or the machine's next deadline.
+//! Silent waiting for a notification has no deadline at all, so it never wakes on its own.
+//! Every wakeup is followed by [`Lifecycle::advance`], so a notification flood can never starve a due deadline.
 
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{self as channel, RecvTimeoutError};
 use objc2_core_foundation::CFMachPort;
 use objc2_core_graphics::{
     CGEvent, CGEventTapCallBack, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -41,20 +16,26 @@ use objc2_core_graphics::{
 };
 
 use crate::Status;
+use crate::dispatcher::BoxedCallback;
+use crate::platform::Worker;
 use crate::status::StatusBroadcast;
 
-use super::{TapShared, TapThread};
+use super::lifecycle::{Lifecycle, Platform};
+use super::tcc::TccWatch;
+use super::{InstallOutcome, TAP_EVENT_MASK, TapShared, TapThread};
 
-const TICK: Duration = Duration::from_millis(200);
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
-/// How long the tap may stay disabled before we treat it as dead and rebuild.
-/// The callback re-enables instantly on ByTimeout, so anything past ~1s means
-/// re-enable failed or the notification never came.
-const TAP_DISABLED_GRACE: Duration = Duration::from_secs(1);
-const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Notifications beyond this are dropped while the supervisor is busy, which is harmless because they coalesce.
+const INBOX_CAPACITY: usize = 64;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Create + immediately invalidate a throwaway tap: the functional permission
-/// probe.
+enum Message {
+    TccChanged,
+    Shutdown,
+}
+
+/// Create and immediately invalidate a throwaway tap: asks WindowServer whether we may filter now.
+/// It is never added to a run loop and is unrelated to the real tap.
+/// A refusal leaks a Mach port pair inside the OS, so only Running calls this on a timer.
 fn probe_tap() -> bool {
     unsafe extern "C-unwind" fn noop(
         _proxy: objc2_core_graphics::CGEventTapProxy,
@@ -64,147 +45,121 @@ fn probe_tap() -> bool {
     ) -> *mut CGEvent {
         event.as_ptr()
     }
-    const MASK: u64 = (1u64 << CGEventType::KeyDown.0)
-        | (1u64 << CGEventType::KeyUp.0)
-        | (1u64 << CGEventType::FlagsChanged.0);
     let callback: CGEventTapCallBack = Some(noop);
     let tap = unsafe {
         CGEvent::tap_create(
             CGEventTapLocation::SessionEventTap,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::Default,
-            MASK,
+            TAP_EVENT_MASK,
             callback,
             null_mut(),
         )
     };
-    if let Some(tap) = tap {
-        CFMachPort::invalidate(&tap);
-        true
-    } else {
-        false
+    match tap {
+        Some(tap) => {
+            CFMachPort::invalidate(&tap);
+            true
+        }
+        None => false,
     }
 }
 
-enum State {
-    /// No tap installed; probing for permission.
-    Silent,
-    /// Tap installed and delivering events.
-    Running,
+/// The real world, as [`Lifecycle`] sees it.
+struct System {
+    tap: TapThread,
+    shared: Arc<TapShared>,
+    broadcast: Arc<StatusBroadcast>,
+}
+
+impl Platform for System {
+    fn install(&mut self) -> InstallOutcome {
+        self.tap.install()
+    }
+
+    fn probe(&mut self) -> bool {
+        probe_tap()
+    }
+
+    fn tap_enabled(&self) -> bool {
+        // An empty slot in Running means the tap is gone, which is as dead as disabled.
+        // This also catches ByUserInput, which leaves the tap disabled.
+        self.shared.tap_is_enabled().unwrap_or(false)
+    }
+
+    fn teardown(&mut self) {
+        // force_invalidate works even if the tap thread is stuck in a user callback.
+        // The queued Teardown then drops the tap thread's local state.
+        self.shared.force_invalidate();
+        self.tap.teardown();
+    }
+
+    fn publish(&mut self, status: Status) {
+        self.broadcast.publish(status);
+    }
 }
 
 pub(crate) struct Supervisor {
-    shutdown: Arc<AtomicBool>,
+    inbox: channel::Sender<Message>,
     shared: Arc<TapShared>,
-    join: Option<JoinHandle<()>>,
+    worker: Worker,
 }
 
 impl Supervisor {
-    pub(crate) fn spawn(
-        tap: TapThread,
-        shared: Arc<TapShared>,
-        broadcast: Arc<StatusBroadcast>,
-    ) -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown2 = shutdown.clone();
-        let shared2 = shared.clone();
-        let join = thread::Builder::new()
-            .name("keyvent-supervisor".into())
-            .spawn(move || supervise(tap, shared, broadcast, shutdown2))
-            .expect("spawn keyvent-supervisor thread");
+    /// Spawn the tap thread and the supervisor thread that manages it.
+    pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
+        let (inbox, messages) = channel::bounded(INBOX_CAPACITY);
+        let shared = Arc::new(TapShared::new());
+        let tap = TapThread::spawn(callback, shared.clone());
+        let system = System {
+            tap,
+            shared: shared.clone(),
+            broadcast,
+        };
+        let tcc_inbox = inbox.clone();
+        let worker = Worker::spawn("keyvent-supervisor", move || {
+            supervise(system, messages, tcc_inbox)
+        });
         Self {
-            shutdown,
-            shared: shared2,
-            join: Some(join),
+            inbox,
+            shared,
+            worker,
         }
     }
 
-    pub(crate) fn shutdown(mut self) {
-        self.shutdown.store(true, SeqCst);
-        // Free system input immediately, even if the tap thread is stuck inside
-        // a user callback and can never process the Shutdown command.
+    pub(crate) fn shutdown(self) {
+        // Free system input immediately, even if the tap thread is stuck inside a user callback.
         self.shared.force_invalidate();
-        if let Some(join) = self.join.take() {
-            crate::platform::join_with_timeout(join, SHUTDOWN_JOIN_TIMEOUT, "supervisor");
-        }
+        // Blocks only while the inbox is full, which ends as soon as the supervisor takes one message.
+        let _ = self.inbox.send_timeout(Message::Shutdown, SHUTDOWN_TIMEOUT);
+        self.worker.join_timeout(SHUTDOWN_TIMEOUT);
     }
 }
 
 fn supervise(
-    tap: TapThread,
-    shared: Arc<TapShared>,
-    broadcast: Arc<StatusBroadcast>,
-    shutdown: Arc<AtomicBool>,
+    mut system: System,
+    messages: channel::Receiver<Message>,
+    tcc_inbox: channel::Sender<Message>,
 ) {
-    let mut state = State::Silent;
-    let mut probe_due = Instant::now(); // probe immediately on start
-    // When the tap was first seen continuously disabled (None while enabled).
-    let mut disabled_since: Option<Instant> = None;
+    // Subscribe before the first install, so a change right after startup is never missed.
+    let _watch = TccWatch::accessibility(move || {
+        let _ = tcc_inbox.try_send(Message::TccChanged);
+    });
+    let mut lifecycle = Lifecycle::new(Instant::now());
 
-    while !shutdown.load(SeqCst) {
-        std::thread::sleep(TICK);
-        let now = Instant::now();
-
-        // Periodic probe.
-        let mut probed: Option<bool> = None;
-        if now >= probe_due {
-            probed = Some(probe_tap());
-            probe_due = now + PROBE_INTERVAL;
+    loop {
+        let received = match lifecycle.deadline() {
+            Some(deadline) => messages.recv_deadline(deadline),
+            None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(Message::TccChanged) => lifecycle.notified(Instant::now()),
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Message::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
-
-        match &state {
-            State::Silent => {
-                if probed == Some(true) && tap.install() {
-                    disabled_since = None;
-                    state = State::Running;
-                    broadcast.publish(Status::Running);
-                    continue;
-                }
-                broadcast.publish(Status::Silent);
-            }
-
-            State::Running => {
-                // Watchdog-disabled detection: the callback re-enables instantly,
-                // so a continuously disabled tap means re-enable failed or the
-                // notification never arrived.
-                let tap_dead = match shared.tap_is_enabled() {
-                    Some(false) => {
-                        let since = disabled_since.get_or_insert(now);
-                        since.elapsed() >= TAP_DISABLED_GRACE
-                    }
-                    _ => {
-                        disabled_since = None;
-                        false
-                    }
-                };
-
-                // Every anomaly takes the same safe-direction path; Silent's
-                // probing brings the tap back when conditions allow.
-                let anomaly = if shared.take_user_input_disabled() {
-                    Some("tap disabled by user input")
-                } else if probed == Some(false) {
-                    // Ground truth: we cannot filter right now (revocation or
-                    // stale permission).
-                    Some("probe NULL while running")
-                } else if tap_dead {
-                    Some("tap continuously disabled")
-                } else {
-                    None
-                };
-                if let Some(reason) = anomaly {
-                    log::warn!("keyvent: {reason}; tearing down tap");
-                    // force_invalidate works even if the tap thread is stuck in
-                    // a user callback; the queued Teardown drops local state.
-                    shared.force_invalidate();
-                    tap.teardown();
-                    disabled_since = None;
-                    state = State::Silent;
-                    broadcast.publish(Status::Silent);
-                }
-            }
-        }
+        lifecycle.advance(Instant::now(), &mut system);
     }
 
-    tap.shutdown();
+    system.tap.shutdown();
     log::debug!("keyvent: supervisor exited");
 }

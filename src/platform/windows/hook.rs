@@ -8,7 +8,6 @@ use std::cell::Cell;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -27,6 +26,7 @@ use super::keycode::{self, Keycode};
 use crate::Status;
 use crate::dispatcher::BoxedCallback;
 use crate::pairing::Pairing;
+use crate::platform::Worker;
 use crate::route;
 use crate::status::StatusBroadcast;
 use crate::suppress::{Action, Suppression};
@@ -34,7 +34,7 @@ use crate::suppress::{Action, Suppression};
 /// Handle to the running hook thread.
 pub(crate) struct HookThread {
     thread_id: u32,
-    join: Option<JoinHandle<()>>,
+    worker: Worker,
 }
 
 impl HookThread {
@@ -43,29 +43,23 @@ impl HookThread {
     /// Running once the hook is installed.
     pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
         let (id_tx, id_rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("keyvent-hook".into())
-            .spawn(move || thread_main(callback, broadcast, id_tx))
-            .expect("spawn keyvent-hook thread");
+        let worker = Worker::spawn("keyvent-hook", move || {
+            thread_main(callback, broadcast, id_tx)
+        });
         let thread_id = id_rx.recv().expect("hook thread died at spawn");
-        Self {
-            thread_id,
-            join: Some(join),
-        }
+        Self { thread_id, worker }
     }
 
     /// Post `WM_QUIT` and join. A stuck thread (misbehaving user callback) is
     /// detached instead of joined forever: the OS skips a wedged low-level
     /// hook, so system input is never frozen.
-    pub(crate) fn shutdown(mut self) {
+    pub(crate) fn shutdown(self) {
         unsafe {
             if PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) == 0 {
                 log::error!("keyvent: failed to post WM_QUIT to the hook thread");
             }
         }
-        if let Some(join) = self.join.take() {
-            crate::platform::join_with_timeout(join, Duration::from_secs(2), "hook");
-        }
+        self.worker.join_timeout(Duration::from_secs(2));
     }
 }
 

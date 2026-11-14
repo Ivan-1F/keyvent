@@ -1,41 +1,37 @@
 //! The tap thread: owns the CGEventTap and its CFRunLoop.
 //!
-//! Caps Lock is delivered as a momentary key: its FlagsChanged events
-//! (keycode 57) signal the lock state toggling and do not carry the
-//! physical release, so each one arrives as a Press immediately followed
-//! by a synthesized Release — tap semantics for the physical key, whose
-//! hold is not representable in this stream; one physical tap may produce
-//! more than one pair on some system paths. The system action echoes are
-//! not physical keys (see [`convert`]). Raw caps events pass to the OS
-//! unsuppressed (see [`crate::hotkey::Suppression`]).
+//! Caps Lock is delivered as a momentary key.
+//! Its FlagsChanged events (keycode 57) signal the lock state toggling, not the physical release.
+//! So each one arrives as a Press immediately followed by a synthesized Release.
+//! The physical hold is not representable in this stream.
+//! One physical tap may produce more than one pair on some system paths.
+//! The system action echoes are not physical keys (see [`convert`]).
+//! Raw caps events pass to the OS unsuppressed (see [`crate::hotkey::Suppression`]).
 //!
 //! Threading model:
-//! - The tap thread is the ONLY thread that runs the event-tap callback, so all
-//!   conversion/tracking/suppression state is lock-free thread-local data.
-//! - The supervisor thread talks to it through a command channel (`Install` /
-//!   `Teardown` / `Shutdown`) and shared atomics (`TapShared`).
-//! - In the emergency case (user callback blocked inside the tap callback), the
-//!   supervisor can bypass the command channel and `CFMachPortInvalidate` the
-//!   tap directly through the shared handle — that call is thread-safe and is
-//!   what keeps a wedged callback from freezing the keyboard.
+//! - Only the tap thread runs the event-tap callback, so its state is lock-free thread-local data.
+//! - The thread sleeps in its run loop. Commands arrive on a channel, and a run loop source wakes it to drain them.
+//! - If a user callback blocks inside the tap callback, the supervisor can still invalidate the tap.
+//!   It calls `CFMachPortInvalidate` on the shared handle, which is thread-safe.
+//!   This is what keeps a wedged callback from freezing the keyboard.
 
 mod convert;
 pub(crate) mod keycode;
-pub(crate) mod supervisor;
+mod lifecycle;
+mod supervisor;
+mod tcc;
 
 pub(crate) use supervisor::Supervisor;
 
 use std::ffi::c_void;
 use std::ptr::{NonNull, null_mut};
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use objc2_core_foundation::{
-    CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes,
-    kCFRunLoopDefaultMode,
+    CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    kCFRunLoopCommonModes,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapCallBack,
@@ -45,283 +41,335 @@ use objc2_core_graphics::{
 use self::keycode::{CAPS_LOCK, Keycode};
 use crate::Modifiers;
 use crate::dispatcher::BoxedCallback;
-
 use crate::pairing::Pairing;
+use crate::platform::Worker;
 use crate::route;
 use crate::suppress::{Action, Suppression};
 use convert::{ModifierTracker, RawKind};
 
-/// Keyboard-only mask: mouse/scroll/gesture events never route through the tap,
-/// so a stalled tap cannot freeze pointer input.
+/// Keyboard-only mask, so a stalled tap cannot freeze pointer input.
 const TAP_EVENT_MASK: u64 = (1u64 << CGEventType::KeyDown.0)
     | (1u64 << CGEventType::KeyUp.0)
     | (1u64 << CGEventType::FlagsChanged.0);
 
-const RUN_LOOP_SLICE: Duration = Duration::from_millis(100);
 const INSTALL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Result of asking the tap thread to install the tap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    /// The tap is installed and delivering events.
+    Installed,
+    /// WindowServer refused the tap: no Accessibility permission right now.
+    /// The refused tap_create leaked a Mach port pair inside the OS.
+    Denied,
+    /// The install failed for another reason, such as an unresponsive tap thread.
+    Failed,
+}
 
 /// State shared between the tap thread and the supervisor thread.
-pub(crate) struct TapShared {
-    /// Live tap handle. The Mutex serializes the slot swap; the CF operations
-    /// on the handle itself (enable/invalidate) are documented thread-safe.
+struct TapShared {
+    /// Live tap handle.
+    /// The Mutex serializes the slot swap; enable and invalidate are documented thread-safe.
     handle: Mutex<Option<TapHandle>>,
-    /// kCGEventTapDisabledByTimeout deliveries since spawn.
-    timeouts: AtomicU32,
-    /// kCGEventTapDisabledByUserInput delivered; the supervisor tears down on
-    /// this.
-    user_input_disabled: AtomicBool,
 }
 
 struct TapHandle(CFRetained<CFMachPort>);
-// CFMachPort refcounting is atomic and CGEventTapEnable/Invalidate are
-// documented callable from any thread; the Mutex in TapShared serializes the
-// slot.
+// CFMachPort refcounting is atomic, and CGEventTapEnable/Invalidate are callable from any thread.
+// The Mutex in TapShared serializes the slot.
 unsafe impl Send for TapHandle {}
 unsafe impl Sync for TapHandle {}
 
 impl TapShared {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             handle: Mutex::new(None),
-            timeouts: AtomicU32::new(0),
-            user_input_disabled: AtomicBool::new(false),
         }
     }
 
-    /// Force-invalidate the live tap from any thread. Returns true if a tap was
-    /// present. The tap thread notices the empty slot on its next iteration and
-    /// drops its own references.
-    pub(crate) fn force_invalidate(&self) -> bool {
-        let handle = self.handle.lock().unwrap().take();
-        if let Some(handle) = handle {
+    /// Force-invalidate the live tap from any thread.
+    /// The tap thread drops its own references when it handles the Teardown that always follows.
+    fn force_invalidate(&self) {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             CFMachPort::invalidate(&handle.0);
-            true
-        } else {
-            false
         }
     }
 
     /// Whether the live tap is currently delivering events. None if no tap.
-    pub(crate) fn tap_is_enabled(&self) -> Option<bool> {
+    fn tap_is_enabled(&self) -> Option<bool> {
         let handle = self.handle.lock().unwrap();
         handle.as_ref().map(|h| CGEvent::tap_is_enabled(&h.0))
-    }
-
-    pub(crate) fn take_user_input_disabled(&self) -> bool {
-        self.user_input_disabled.swap(false, SeqCst)
     }
 }
 
 /// Commands from the supervisor to the tap thread.
-pub(crate) enum TapCommand {
-    /// Create and install the tap; replies with success.
-    Install(mpsc::Sender<bool>),
+enum TapCommand {
+    /// Create and install the tap; replies with the outcome.
+    Install(mpsc::Sender<InstallOutcome>),
     /// Tear down the tap (remove from event chain, keep the thread).
     Teardown,
     /// Tear down and exit the thread.
     Shutdown,
 }
 
+/// Wakes the tap thread's run loop so it drains the command channel.
+struct RunLoopWaker {
+    run_loop: CFRetained<CFRunLoop>,
+    source: CFRetained<CFRunLoopSource>,
+}
+
+// Only CFRunLoopSourceSignal and CFRunLoopWakeUp are called through this, and both are meant for other threads.
+// Refcounting is atomic, so the final release may happen on any thread.
+unsafe impl Send for RunLoopWaker {}
+
+impl RunLoopWaker {
+    fn wake(&self) {
+        self.source.signal();
+        self.run_loop.wake_up();
+    }
+}
+
 /// Handle to the running tap thread.
-pub(crate) struct TapThread {
-    cmd: mpsc::Sender<TapCommand>,
-    join: Option<JoinHandle<()>>,
+struct TapThread {
+    commands: mpsc::Sender<TapCommand>,
+    waker: RunLoopWaker,
+    /// Reply channel of an install that timed out. At most one such install is ever outstanding.
+    stalled_install: Option<mpsc::Receiver<InstallOutcome>>,
+    worker: Worker,
 }
 
 impl TapThread {
-    pub(crate) fn spawn(callback: BoxedCallback, shared: Arc<TapShared>) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("keyvent-tap".into())
-            .spawn(move || thread_main(callback, shared, cmd_rx))
-            .expect("spawn keyvent-tap thread");
+    /// Spawn the tap thread; returns once its run loop can be woken, so no command is ever lost.
+    fn spawn(callback: BoxedCallback, shared: Arc<TapShared>) -> Self {
+        let (commands, command_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = Worker::spawn("keyvent-tap", move || {
+            thread_main(callback, shared, command_rx, ready_tx)
+        });
+        let waker = ready_rx.recv().expect("keyvent-tap thread died at startup");
         Self {
-            cmd: cmd_tx,
-            join: Some(join),
+            commands,
+            waker,
+            stalled_install: None,
+            worker,
         }
     }
 
-    /// Ask the tap thread to create + install the tap; blocks up to
-    /// `INSTALL_REPLY_TIMEOUT` for the result.
-    pub(crate) fn install(&self) -> bool {
-        let (tx, rx) = mpsc::channel();
-        if self.cmd.send(TapCommand::Install(tx)).is_err() {
+    fn send(&self, command: TapCommand) -> bool {
+        if self.commands.send(command).is_err() {
             return false;
         }
-        match rx.recv_timeout(INSTALL_REPLY_TIMEOUT) {
-            Ok(ok) => ok,
-            Err(_) => {
-                // Timeout means cancel: the queued Install may execute much later
-                // (e.g. after a stuck user callback returns), so append a Teardown
-                // right behind it — the pair's net effect is always zero.
-                let _ = self.cmd.send(TapCommand::Teardown);
-                false
+        self.waker.wake();
+        true
+    }
+
+    /// Ask the tap thread to create and install the tap, waiting up to `INSTALL_REPLY_TIMEOUT`.
+    fn install(&mut self) -> InstallOutcome {
+        if let Some(stalled) = &self.stalled_install {
+            if let Err(TryRecvError::Empty) = stalled.try_recv() {
+                // Still busy with the last install, e.g. stuck in a user callback: queue nothing more.
+                return InstallOutcome::Failed;
             }
+            self.stalled_install = None;
+        }
+        let (reply, outcome) = mpsc::channel();
+        if !self.send(TapCommand::Install(reply)) {
+            return InstallOutcome::Failed;
+        }
+        match outcome.recv_timeout(INSTALL_REPLY_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                // The queued Install may still run much later, after a stuck user callback returns.
+                // The Teardown right behind it makes the pair's net effect zero.
+                self.send(TapCommand::Teardown);
+                self.stalled_install = Some(outcome);
+                InstallOutcome::Failed
+            }
+            Err(RecvTimeoutError::Disconnected) => InstallOutcome::Failed,
         }
     }
 
     /// Ask the tap thread to tear the tap down (non-blocking).
-    pub(crate) fn teardown(&self) {
-        let _ = self.cmd.send(TapCommand::Teardown);
+    fn teardown(&self) {
+        self.send(TapCommand::Teardown);
     }
 
-    /// Shut the thread down. If the thread is stuck (e.g. inside a misbehaving
-    /// user callback), detach instead of hanging forever — the supervisor has
-    /// already force-invalidated the tap, so the stuck thread is inert.
-    pub(crate) fn shutdown(mut self) {
-        let _ = self.cmd.send(TapCommand::Shutdown);
-        if let Some(join) = self.join.take() {
-            crate::platform::join_with_timeout(join, Duration::from_secs(2), "tap");
-        }
+    /// Shut the thread down, detaching instead of hanging if it is stuck in a user callback.
+    /// The supervisor has already force-invalidated the tap, so a stuck thread is inert.
+    fn shutdown(self) {
+        self.send(TapCommand::Shutdown);
+        self.worker.join_timeout(SHUTDOWN_JOIN_TIMEOUT);
     }
 }
 
-/// Everything the tap callback needs, living on the tap thread's stack.
-/// The callback receives a raw pointer to this via user_info; it is valid for
-/// the whole lifetime of the run loop.
+/// Everything the tap thread's callouts need.
+/// It lives on the heap for the whole run loop, and every callout reaches it through the same raw pointer.
 struct Ctx {
     callback: BoxedCallback,
     tracker: ModifierTracker,
     suppression: Suppression,
     pairing: Pairing,
-    tap: Option<CFRetained<CFMachPort>>,
-    source: Option<CFRetained<CFRunLoopSource>>,
+    tap: Option<InstalledTap>,
     shared: Arc<TapShared>,
+    commands: mpsc::Receiver<TapCommand>,
+}
+
+/// The tap as the tap thread holds it.
+struct InstalledTap {
+    port: CFRetained<CFMachPort>,
+    source: CFRetained<CFRunLoopSource>,
 }
 
 fn thread_main(
     callback: BoxedCallback,
     shared: Arc<TapShared>,
-    cmd_rx: mpsc::Receiver<TapCommand>,
+    commands: mpsc::Receiver<TapCommand>,
+    ready: mpsc::Sender<RunLoopWaker>,
 ) {
-    let mut ctx = Ctx {
+    let ctx = Box::into_raw(Box::new(Ctx {
         callback,
         tracker: ModifierTracker::default(),
         suppression: Suppression::default(),
         pairing: Pairing::default(),
         tap: None,
-        source: None,
         shared,
+        commands,
+    }));
+    let mut context = CFRunLoopSourceContext {
+        version: 0,
+        info: ctx.cast(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+        equal: None,
+        hash: None,
+        schedule: None,
+        cancel: None,
+        perform: Some(perform_commands),
     };
+    // CFRunLoopSourceCreate copies the context; `info` stays valid until the source is invalidated below.
+    let source = unsafe { CFRunLoopSource::new(None, 0, &mut context) }
+        .expect("create the tap thread's command source");
+    let run_loop = CFRunLoop::current().expect("tap thread run loop");
+    unsafe { run_loop.add_source(Some(&source), kCFRunLoopCommonModes) };
 
-    'outer: loop {
-        // Drain pending commands first (low-latency path between run loop slices).
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                TapCommand::Install(reply) => {
-                    let _ = reply.send(install(&mut ctx));
-                }
-                TapCommand::Teardown => teardown(&mut ctx),
-                TapCommand::Shutdown => break 'outer,
-            }
-        }
-
-        if ctx.tap.is_some() {
-            unsafe {
-                CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, RUN_LOOP_SLICE.as_secs_f64(), true)
-            };
-            // Did the supervisor force-invalidate behind our back?
-            if ctx.shared.handle.lock().unwrap().is_none() {
-                log::warn!("keyvent: tap was force-invalidated externally; dropping local state");
-                drop_local_tap(&mut ctx);
-            }
-        } else {
-            // No tap installed: wait for commands without burning CPU.
-            match cmd_rx.recv_timeout(RUN_LOOP_SLICE) {
-                Ok(TapCommand::Install(reply)) => {
-                    let _ = reply.send(install(&mut ctx));
-                }
-                Ok(TapCommand::Teardown) => {}
-                Ok(TapCommand::Shutdown) => break 'outer,
-                Err(_) => {}
-            }
-        }
+    let waker = RunLoopWaker {
+        run_loop,
+        source: source.clone(),
+    };
+    if ready.send(waker).is_ok() {
+        // Returns once a Shutdown command stops the run loop.
+        CFRunLoop::run();
     }
 
+    source.invalidate();
+    // Every callout is finished and none can start, so this is the last access through `ctx`.
+    let mut ctx = unsafe { Box::from_raw(ctx) };
     teardown(&mut ctx);
     log::debug!("keyvent: tap thread exited");
 }
 
-/// Create + install the tap on this thread's run loop.
-fn install(ctx: &mut Ctx) -> bool {
+/// Run loop callout for the command source: drain every queued command.
+unsafe extern "C-unwind" fn perform_commands(info: *mut c_void) {
+    let ctx = info.cast::<Ctx>();
+    loop {
+        // The shared borrow ends with this statement, before any command takes `&mut Ctx`.
+        let command = unsafe { (*ctx).commands.try_recv() };
+        let Ok(command) = command else {
+            return;
+        };
+        match command {
+            TapCommand::Install(reply) => {
+                let _ = reply.send(unsafe { install(ctx) });
+            }
+            TapCommand::Teardown => teardown(unsafe { &mut *ctx }),
+            TapCommand::Shutdown => {
+                teardown(unsafe { &mut *ctx });
+                if let Some(run_loop) = CFRunLoop::current() {
+                    run_loop.stop();
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Create and install the tap on this thread's run loop.
+///
+/// # Safety
+///
+/// `ctx_ptr` is the tap thread's context pointer, and no other borrow of it is alive.
+unsafe fn install(ctx_ptr: *mut Ctx) -> InstallOutcome {
+    let ctx = unsafe { &mut *ctx_ptr };
     if ctx.tap.is_some() {
-        return true;
+        return InstallOutcome::Installed;
     }
     let callback: CGEventTapCallBack = Some(raw_callback);
-    let tap = unsafe {
+    // The tap callback gets the same pointer every other callout uses.
+    let port = unsafe {
         CGEvent::tap_create(
             CGEventTapLocation::SessionEventTap,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::Default,
             TAP_EVENT_MASK,
             callback,
-            ctx as *mut Ctx as *mut c_void,
+            ctx_ptr.cast(),
         )
     };
-    let Some(tap) = tap else {
+    let Some(port) = port else {
         log::debug!("keyvent: tap_create returned NULL (no permission or not yet effective)");
-        return false;
+        return InstallOutcome::Denied;
     };
-    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
+    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&port), 0) else {
         log::error!("keyvent: failed to create run loop source");
-        return false;
+        CFMachPort::invalidate(&port);
+        return InstallOutcome::Failed;
     };
-    // Initialize modifier tracking from physical truth, so keys held while the
-    // stream starts are tracked correctly instead of guessed later.
+    // Initialize modifier tracking from physical truth, so keys held at stream start are tracked.
     ctx.tracker.init_from_physical(|code| {
         CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
     });
-    // Reconcile the ledgers against physical truth now — not at teardown: the
-    // query needs the permission we only know is present right now. Presses
-    // physically released while the stream was down close with synthetic
-    // releases; keys still held stay open and close on their real release.
+    // Reconcile the ledgers against physical truth now, not at teardown.
+    // The query needs the permission, which we only know is present right now.
+    // Presses released while the stream was down close with synthetic releases.
+    // Keys still held stay open and close on their real release.
     reconcile_books(ctx);
-    // Only now wire the tap into the event chain: events delivered after this
-    // point meet ledgers that already match physical truth. Enabling earlier
-    // would let a release generated before reconcile slip past the ledger it
-    // just cleared (a phantom release for the OS).
-    let run_loop = CFRunLoop::current().unwrap();
+    // Only now wire the tap into the event chain, so new events meet reconciled ledgers.
+    // Enabling earlier could let a release slip past the ledger it just cleared (a phantom release).
+    let run_loop = CFRunLoop::current().expect("tap thread run loop");
     unsafe { run_loop.add_source(Some(&source), kCFRunLoopCommonModes) };
-    CGEvent::tap_enable(&tap, true);
-    *ctx.shared.handle.lock().unwrap() = Some(TapHandle(tap.clone()));
-    ctx.tap = Some(tap);
-    ctx.source = Some(source);
+    CGEvent::tap_enable(&port, true);
+    *ctx.shared.handle.lock().unwrap() = Some(TapHandle(port.clone()));
+    ctx.tap = Some(InstalledTap { port, source });
     log::info!("keyvent: event tap installed");
-    true
+    InstallOutcome::Installed
 }
 
-/// Full teardown: remove from run loop, disable, invalidate. Safe to call with
-/// no tap installed. The ledgers are deliberately left untouched: presses stay
-/// open so they can be reconciled against physical truth at the next install —
-/// synthesizing releases here would fabricate events for keys the user may
-/// still be holding.
+/// Full teardown: remove from run loop, disable, invalidate; safe with no tap installed.
+/// The ledgers are deliberately left untouched, so presses can be reconciled at the next install.
+/// Synthesizing releases here would fabricate events for keys the user may still be holding.
 fn teardown(ctx: &mut Ctx) {
-    drop_local_tap(ctx);
+    // Already empty if the supervisor force-invalidated first.
     ctx.shared.handle.lock().unwrap().take();
-}
-
-/// Drop run-loop-local tap state without touching the shared handle slot
-/// (used when the supervisor already invalidated it).
-fn drop_local_tap(ctx: &mut Ctx) {
-    if let (Some(tap), Some(source)) = (ctx.tap.take(), ctx.source.take()) {
-        if let Some(run_loop) = CFRunLoop::current() {
-            unsafe { run_loop.remove_source(Some(&source), kCFRunLoopCommonModes) };
-        }
-        CGEvent::tap_enable(&tap, false);
-        CFMachPort::invalidate(&tap);
-        log::info!("keyvent: event tap torn down");
+    let Some(tap) = ctx.tap.take() else {
+        return;
+    };
+    if let Some(run_loop) = CFRunLoop::current() {
+        unsafe { run_loop.remove_source(Some(&tap.source), kCFRunLoopCommonModes) };
     }
+    CGEvent::tap_enable(&tap.port, false);
+    CFMachPort::invalidate(&tap.port);
+    log::info!("keyvent: event tap torn down");
 }
 
-/// Reconcile the ledgers against physical key state. Called at tap install
-/// (rebuild after permission loss) and on tap-disabled recovery (timeout):
-/// presses whose key is physically up are closed with synthetic releases,
-/// while keys still held stay open and close on their real release.
+/// Reconcile the ledgers against physical key state.
+/// Called at tap install and on tap-disabled recovery (timeout).
+/// Presses whose key is physically up are closed with synthetic releases.
+/// Keys still held stay open and close on their real release.
 fn reconcile_books(ctx: &mut Ctx) {
-    // key_state reports the lock state for Caps Lock, not the physical key,
-    // so it cannot verify a caps entry. Physical caps taps close atomically
-    // (press and release dispatch back to back), so a dangling caps entry is
-    // always a posted event whose release was lost: close it.
+    // key_state reports the lock state for Caps Lock, so it cannot verify a caps entry.
+    // Physical caps taps close atomically (press and release dispatch back to back).
+    // So a dangling caps entry is always a posted event whose release was lost: close it.
     ctx.suppression.reconcile(|code| {
         code != CAPS_LOCK
             && CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
@@ -369,9 +417,8 @@ fn modifiers_from_cg(flags: CGEventFlags) -> Modifiers {
 
 /// The raw event-tap callback. Runs on the tap thread only.
 ///
-/// Latency contract: everything here is O(µs) — convert, bookkeeping, and the
-/// user callback (which the API contract requires to be non-blocking). There
-/// are no locks, no allocations on the hot path, and no cross-thread calls.
+/// Latency contract: everything here is O(µs), including the non-blocking user callback.
+/// There are no locks, no allocations on the hot path, and no cross-thread calls.
 unsafe extern "C-unwind" fn raw_callback(
     _proxy: objc2_core_graphics::CGEventTapProxy,
     event_type: CGEventType,
@@ -383,18 +430,16 @@ unsafe extern "C-unwind" fn raw_callback(
 
     // Tap-disabled housekeeping events.
     if event_type == CGEventType::TapDisabledByTimeout {
-        ctx.shared.timeouts.fetch_add(1, SeqCst);
         reconcile_books(ctx);
         if let Some(tap) = &ctx.tap {
-            CGEvent::tap_enable(tap, true);
+            CGEvent::tap_enable(&tap.port, true);
         }
         log::warn!("keyvent: tap disabled by timeout; re-enabled");
         return event.as_ptr();
     }
     if event_type == CGEventType::TapDisabledByUserInput {
-        // Never re-enable on this path (it may mean permission loss). The
-        // supervisor decides what to do (teardown closes the stream).
-        ctx.shared.user_input_disabled.store(true, SeqCst);
+        // Never re-enable on this path, since it may mean permission loss.
+        // The tap stays disabled, so the supervisor's next check tears it down.
         log::warn!("keyvent: tap disabled by user input");
         return event.as_ptr();
     }

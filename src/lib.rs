@@ -46,7 +46,7 @@ pub use hotkey::{
 
 use crate::dispatcher::{BoxedCallback, Dispatcher, DispatcherCommand};
 #[cfg(target_os = "macos")]
-use crate::platform::macos::{Supervisor, TapShared, TapThread};
+use crate::platform::macos::Supervisor;
 #[cfg(target_os = "windows")]
 use crate::platform::windows::HookThread;
 use status::StatusBroadcast;
@@ -99,11 +99,7 @@ impl Engine {
         let callback: BoxedCallback = Box::new(move |event| dispatcher.handle(event));
         let broadcast = Arc::new(StatusBroadcast::new(Status::Silent));
         #[cfg(target_os = "macos")]
-        let supervisor = {
-            let shared = Arc::new(TapShared::new());
-            let tap = TapThread::spawn(callback, shared.clone());
-            Supervisor::spawn(tap, shared, broadcast.clone())
-        };
+        let supervisor = Supervisor::spawn(callback, broadcast.clone());
         #[cfg(target_os = "windows")]
         let hook = HookThread::spawn(callback, broadcast.clone());
         Arc::new(Self {
