@@ -1,9 +1,5 @@
 /target
 
 .idea
-src/bin/
-scripts/
-
-docs/
-logs/
+/private/
 .DS_Store

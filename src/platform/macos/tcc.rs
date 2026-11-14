@@ -4,7 +4,6 @@
 //! It fires on grant, revoke, entry removal, and entry insertion, for every app system-wide.
 //! It carries no payload, so it only means "re-check now", never "you were granted".
 //! The name is undocumented, and any process can post it.
-//! See docs/macos-permission.md, section 4.5.
 
 use std::ffi::{CStr, c_char, c_int};
 

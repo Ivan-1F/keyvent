@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ivan-1F/keyvent"
 keywords = ["hotkey", "keyboard", "macos", "event-tap", "global"]
 categories = ["os::macos-apis", "api-bindings"]
-exclude = ["src/bin/", "scripts/", "docs/", "target/"]
+exclude = ["private/"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
@@ -31,7 +31,3 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
-
-[[bin]]
-name = "keyvent-spike"
-path = "src/bin/keyvent-spike.rs"

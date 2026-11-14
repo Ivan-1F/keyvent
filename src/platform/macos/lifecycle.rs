@@ -2,7 +2,6 @@
 //!
 //! Only tap_create tells whether we may filter keyboard events: in-process permission queries cache stale answers.
 //! A refused tap_create leaks a Mach port pair inside the OS, so asking must be rare while the answer is likely no.
-//! See docs/macos-permission.md.
 //!
 //! The policy:
 //! - Running checks once per second, and tears the tap down if the check fails.
