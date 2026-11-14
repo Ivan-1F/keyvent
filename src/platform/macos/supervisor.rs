@@ -1,8 +1,5 @@
 //! The supervisor thread: drives the [`Lifecycle`] state machine with real time and the real OS.
-//!
-//! The thread sleeps until something happens: a TCC notification, shutdown, or the machine's next deadline.
-//! Silent waiting for a notification has no deadline at all, so it never wakes on its own.
-//! Every wakeup is followed by [`Lifecycle::advance`], so a notification flood can never starve a due deadline.
+//! It sleeps until a TCC notification, shutdown, or the machine's next deadline.
 
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -21,8 +18,9 @@ use crate::platform::Worker;
 use crate::status::StatusBroadcast;
 
 use super::lifecycle::{Lifecycle, Platform};
+use super::stream::{InstallOutcome, SharedTap, Stream, TAP_EVENT_MASK};
+use super::tap::TapThread;
 use super::tcc::TccWatch;
-use super::{InstallOutcome, TAP_EVENT_MASK, TapShared, TapThread};
 
 /// Notifications beyond this are dropped while the supervisor is busy, which is harmless because they coalesce.
 const INBOX_CAPACITY: usize = 64;
@@ -33,9 +31,7 @@ enum Message {
     Shutdown,
 }
 
-/// Create and immediately invalidate a throwaway tap: asks WindowServer whether we may filter now.
-/// It is never added to a run loop and is unrelated to the real tap.
-/// A refusal leaks a Mach port pair inside the OS, so only Running calls this on a timer.
+/// Ask WindowServer, with a throwaway tap, whether we may filter keyboard events now.
 fn probe_tap() -> bool {
     unsafe extern "C-unwind" fn noop(
         _proxy: objc2_core_graphics::CGEventTapProxy,
@@ -68,13 +64,16 @@ fn probe_tap() -> bool {
 /// The real world, as [`Lifecycle`] sees it.
 struct System {
     tap: TapThread,
-    shared: Arc<TapShared>,
+    shared: Arc<SharedTap>,
     broadcast: Arc<StatusBroadcast>,
 }
 
 impl Platform for System {
     fn install(&mut self) -> InstallOutcome {
-        self.tap.install()
+        // Waits as long as the tap thread is busy: until then there is nothing else worth doing.
+        self.tap
+            .call(Stream::install)
+            .unwrap_or(InstallOutcome::Failed)
     }
 
     fn probe(&mut self) -> bool {
@@ -82,16 +81,14 @@ impl Platform for System {
     }
 
     fn tap_enabled(&self) -> bool {
-        // An empty slot in Running means the tap is gone, which is as dead as disabled.
-        // This also catches ByUserInput, which leaves the tap disabled.
-        self.shared.tap_is_enabled().unwrap_or(false)
+        self.shared.is_enabled()
     }
 
     fn teardown(&mut self) {
-        // force_invalidate works even if the tap thread is stuck in a user callback.
-        // The queued Teardown then drops the tap thread's local state.
-        self.shared.force_invalidate();
-        self.tap.teardown();
+        // Invalidating here works even if the tap thread is stuck in a user callback.
+        // The posted teardown then drops the tap thread's own references.
+        self.shared.invalidate();
+        self.tap.post(Stream::teardown);
     }
 
     fn publish(&mut self, status: Status) {
@@ -101,7 +98,7 @@ impl Platform for System {
 
 pub(crate) struct Supervisor {
     inbox: channel::Sender<Message>,
-    shared: Arc<TapShared>,
+    shared: Arc<SharedTap>,
     worker: Worker,
 }
 
@@ -109,7 +106,7 @@ impl Supervisor {
     /// Spawn the tap thread and the supervisor thread that manages it.
     pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
         let (inbox, messages) = channel::bounded(INBOX_CAPACITY);
-        let shared = Arc::new(TapShared::new());
+        let shared = Arc::new(SharedTap::new());
         let tap = TapThread::spawn(callback, shared.clone());
         let system = System {
             tap,
@@ -129,7 +126,8 @@ impl Supervisor {
 
     pub(crate) fn shutdown(self) {
         // Free system input immediately, even if the tap thread is stuck inside a user callback.
-        self.shared.force_invalidate();
+        // Closing also refuses an install that a stuck tap thread may still be about to run.
+        self.shared.close();
         // Blocks only while the inbox is full, which ends as soon as the supervisor takes one message.
         let _ = self.inbox.send_timeout(Message::Shutdown, SHUTDOWN_TIMEOUT);
         self.worker.join_timeout(SHUTDOWN_TIMEOUT);
@@ -157,6 +155,7 @@ fn supervise(
             Err(RecvTimeoutError::Timeout) => {}
             Ok(Message::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
+        // After every message too, so a notification flood cannot starve a due deadline.
         lifecycle.advance(Instant::now(), &mut system);
     }
 

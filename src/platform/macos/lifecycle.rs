@@ -1,62 +1,49 @@
-//! The permission-lifecycle state machine, free of threads, channels and OS calls.
+//! When to install, check and tear down the tap; free of threads and OS calls, so tests run it on a fake clock.
 //!
-//! The ground truth for "may this process filter keyboard events" is WindowServer.
-//! The only way to ask it is tap_create: success is free, but a refused call leaks a Mach port pair.
-//! The leak is inside the OS, and the caller has nothing to release.
-//! In-process permission queries all cache stale answers (see docs/macos-permission.md).
+//! Only tap_create tells whether we may filter keyboard events: in-process permission queries cache stale answers.
+//! A refused tap_create leaks a Mach port pair inside the OS, so asking must be rare while the answer is likely no.
+//! See docs/macos-permission.md.
 //!
-//! The whole policy is three rules:
+//! The policy:
 //! - Running checks once per second, and tears the tap down if the check fails.
 //! - Silent tries to install only for a reason, one `SETTLE` after it: startup, a notification, leaving Running, or a failure unrelated to the permission.
 //! - After a refusal, nothing is tried again until a notification arrives.
 //!
-//! ```text
-//! Silent  --install succeeds----------------------> Running
-//! Running --probe refused, or tap disabled--------> teardown, Silent (retry after SETTLE)
-//! ```
-//!
-//! Leaving Running always earns one retry, so a grant notification lost while Running is harmless.
-//! Each refused tap_create follows startup, a notification, or the end of a Running stint.
-//! Leaks therefore scale with permission changes, never with uptime.
-//!
-//! Time comes in as a parameter and the OS only through [`Platform`], so tests drive the machine with a fake clock and a fake OS.
+//! Leaving Running always earns one retry, because a grant notification arriving in Running is ignored.
+//! So leaks scale with permission changes, never with uptime.
 
 use std::time::{Duration, Instant};
 
 use crate::Status;
 
-use super::InstallOutcome;
+use super::stream::InstallOutcome;
 
-/// How often Running checks the permission and the tap.
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
-/// How long Silent waits before any install attempt.
-/// tccd notifies before WindowServer applies a change; grants took effect within 47ms in tests.
-/// Each new notification restarts the wait, so a burst or a flood yields at most one attempt.
-/// Too long only delays hotkeys after a grant; too short could miss the grant entirely.
+/// Wait before any install attempt.
+/// tccd notifies before WindowServer applies a change (at most 47ms later in tests), so a shorter wait could miss a grant.
+/// Each notification restarts the wait, so a burst or a flood yields at most one attempt.
 const SETTLE: Duration = Duration::from_secs(1);
 
-/// The OS operations the machine decides on.
 pub(super) trait Platform {
-    /// Create and install the real tap. A Denied outcome leaked a Mach port pair.
+    /// Denied leaks a Mach port pair.
     fn install(&mut self) -> InstallOutcome;
-    /// Ask WindowServer with a throwaway tap. A refusal leaks a Mach port pair.
+    /// A refusal leaks a Mach port pair.
     fn probe(&mut self) -> bool;
-    /// Whether the installed tap is enabled right now.
     fn tap_enabled(&self) -> bool;
-    /// Remove the installed tap, even if the tap thread is stuck in a user callback.
+    /// Must work even while the tap thread is stuck in a user callback.
     fn teardown(&mut self);
     fn publish(&mut self, status: Status);
 }
 
 #[derive(Debug)]
 enum State {
-    /// No tap installed.
     Silent {
-        /// When to try installing; None means wait for a notification, with no wakeups at all.
+        /// None: wait for a notification, with no wakeups at all.
         attempt_at: Option<Instant>,
     },
-    /// The tap is installed and delivering events.
-    Running { next_check: Instant },
+    Running {
+        next_check: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -65,7 +52,6 @@ pub(super) struct Lifecycle {
 }
 
 impl Lifecycle {
-    /// Start Silent, with an install attempt due right away.
     pub(super) fn new(now: Instant) -> Self {
         Self {
             state: State::Silent {
@@ -74,7 +60,7 @@ impl Lifecycle {
         }
     }
 
-    /// When [`advance`](Self::advance) next has work to do; None means only a notification can change anything.
+    /// When [`advance`](Self::advance) next has work to do; None if only a notification can change anything.
     pub(super) fn deadline(&self) -> Option<Instant> {
         match self.state {
             State::Silent { attempt_at } => attempt_at,
@@ -82,15 +68,14 @@ impl Lifecycle {
         }
     }
 
-    /// TCC posted an Accessibility change for some app. Running ignores it, since it checks on its own.
+    /// TCC posted an Accessibility change for some app; Running checks on its own and ignores it.
     pub(super) fn notified(&mut self, now: Instant) {
         if let State::Silent { attempt_at } = &mut self.state {
             *attempt_at = Some(now + SETTLE);
         }
     }
 
-    /// Run whatever is due at `now`.
-    /// Later deadlines count from `now` even if an install blocks for a while, so they can only come early.
+    /// Deadlines set here count from `now` even if an install blocks for a while, so they can only come early.
     pub(super) fn advance(&mut self, now: Instant, platform: &mut impl Platform) {
         match self.state {
             State::Silent { attempt_at } if attempt_at.is_some_and(|at| now >= at) => {
@@ -356,7 +341,7 @@ mod tests {
         assert_eq!(sim.os.refusals, 2);
     }
 
-    /// A grant notification that arrives while Running must not be needed after the refused probe it races.
+    /// A grant that races a refused probe must still be picked up.
     #[test]
     fn regrant_racing_a_refused_probe_still_installs() {
         let mut sim = Sim::start(true);

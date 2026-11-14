@@ -15,7 +15,7 @@ use crossbeam_channel::{self as channel, RecvTimeoutError};
 /// Raw platform keycode (macOS keycode, Windows scan code).
 pub(crate) type Keycode = u16;
 
-/// A named thread whose exit can be awaited with a timeout, without polling.
+/// A named thread whose exit can be awaited with a timeout.
 pub(crate) struct Worker {
     join: JoinHandle<()>,
     /// Disconnects once the thread body returns or unwinds; nothing is ever sent on it.
@@ -29,7 +29,6 @@ impl Worker {
         let join = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                // Dropped when the body returns or unwinds, which disconnects `exited`.
                 let _exit_signal = exit_signal;
                 body();
             })

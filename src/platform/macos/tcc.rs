@@ -29,12 +29,11 @@ unsafe extern "C" {
     fn notify_cancel(token: c_int) -> u32;
 }
 
-/// A subscription to a Darwin notification name.
-/// The handler runs on a private serial dispatch queue, so no thread of ours has to poll.
-/// Dropping the watch cancels the subscription; a delivery already queued may still run once.
+/// A subscription to a Darwin notification, delivered on a private serial dispatch queue.
+/// Dropping it cancels the subscription, though a delivery already queued may still run once.
 pub(super) struct TccWatch {
     token: c_int,
-    /// libnotify retains the queue too; holding it here keeps that detail out of our correctness.
+    /// libnotify retains the queue too; holding it here means we do not rely on that.
     _queue: DispatchRetained<DispatchQueue>,
 }
 
