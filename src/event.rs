@@ -500,8 +500,8 @@ pub(crate) fn parse_modifier_token(token: &str) -> Option<Modifiers> {
 }
 
 impl fmt::Display for Modifiers {
-    /// Named bits joined by `+` in [`MODIFIER_TOKENS`] order, any unnamed bits
-    /// as a trailing `0x..` hex token; the empty set is the empty string.
+    /// Named bits joined by `+` in the order `Fn+Ctrl+Alt+Shift+Super`, then any unnamed bits as a `0x..` hex token.
+    /// The empty set formats as the empty string.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<String> = MODIFIER_TOKENS
             .iter()
