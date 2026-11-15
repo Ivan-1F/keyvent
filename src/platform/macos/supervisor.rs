@@ -1,11 +1,12 @@
 //! The supervisor thread: drives the [`Lifecycle`] state machine with real time and the real OS.
-//! It sleeps until a TCC notification, shutdown, or the machine's next deadline.
+//! It sleeps until shutdown, a TCC notification, or the machine's next deadline.
 
+use std::convert::Infallible;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{self as channel, RecvTimeoutError};
+use crossbeam_channel::{self as channel, select_biased};
 use objc2_core_foundation::CFMachPort;
 use objc2_core_graphics::{
     CGEvent, CGEventTapCallBack, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -22,14 +23,7 @@ use super::stream::{InstallOutcome, SharedTap, Stream, TAP_EVENT_MASK};
 use super::tap::TapThread;
 use super::tcc::TccWatch;
 
-/// Notifications beyond this are dropped while the supervisor is busy, which is harmless because they coalesce.
-const INBOX_CAPACITY: usize = 64;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
-enum Message {
-    TccChanged,
-    Shutdown,
-}
 
 /// Ask WindowServer, with a throwaway tap, whether we may filter keyboard events now.
 fn probe_tap() -> bool {
@@ -97,7 +91,8 @@ impl Platform for System {
 }
 
 pub(crate) struct Supervisor {
-    inbox: channel::Sender<Message>,
+    /// Dropping it is the shutdown signal, which unlike a message can never be lost.
+    stop: channel::Sender<Infallible>,
     shared: Arc<SharedTap>,
     worker: Worker,
 }
@@ -106,7 +101,9 @@ impl Supervisor {
     /// Spawn the tap thread and the supervisor thread that manages it.
     /// Returns after the first check, so the status is already meaningful.
     pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
-        let (inbox, messages) = channel::bounded(INBOX_CAPACITY);
+        let (stop, stopped) = channel::bounded(0);
+        // Notifications carry nothing, so one pending is as good as many.
+        let (notify, notifications) = channel::bounded(1);
         let shared = Arc::new(SharedTap::new());
         let tap = TapThread::spawn(callback, shared.clone());
         let mut system = System {
@@ -115,16 +112,24 @@ impl Supervisor {
             broadcast,
         };
         // Subscribed before the first check, so a change right after it is never missed.
-        let tcc_inbox = inbox.clone();
         let watch = TccWatch::accessibility(move || {
-            let _ = tcc_inbox.try_send(Message::TccChanged);
+            let _ = notify.try_send(());
         });
+        // A failed subscription drops the sender, and a disconnected channel would always be ready.
+        let notifications = if watch.is_some() {
+            notifications
+        } else {
+            channel::never()
+        };
         let lifecycle = Lifecycle::start(Instant::now(), &mut system);
         let worker = Worker::spawn("keyvent-supervisor", move || {
-            supervise(system, lifecycle, watch, messages)
+            let _watch = watch;
+            run(lifecycle, &mut system, &notifications, &stopped);
+            system.tap.shutdown();
+            log::debug!("keyvent: supervisor exited");
         });
         Self {
-            inbox,
+            stop,
             shared,
             worker,
         }
@@ -134,32 +139,97 @@ impl Supervisor {
         // Free system input immediately, even if the tap thread is stuck inside a user callback.
         // Closing also refuses an install that a stuck tap thread may still be about to run.
         self.shared.close();
-        // Blocks only while the inbox is full, which ends as soon as the supervisor takes one message.
-        let _ = self.inbox.send_timeout(Message::Shutdown, SHUTDOWN_TIMEOUT);
+        drop(self.stop);
         self.worker.join_timeout(SHUTDOWN_TIMEOUT);
     }
 }
 
-fn supervise(
-    mut system: System,
+/// Drive `lifecycle` until `stopped` disconnects.
+fn run(
     mut lifecycle: Lifecycle,
-    _watch: Option<TccWatch>,
-    messages: channel::Receiver<Message>,
+    platform: &mut impl Platform,
+    notifications: &channel::Receiver<()>,
+    stopped: &channel::Receiver<Infallible>,
 ) {
     loop {
-        let received = match lifecycle.deadline() {
-            Some(deadline) => messages.recv_deadline(deadline),
-            None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
-        };
-        match received {
-            Ok(Message::TccChanged) => lifecycle.notified(Instant::now()),
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(Message::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+        let deadline = lifecycle
+            .deadline()
+            .map_or_else(channel::never, channel::at);
+        select_biased! {
+            recv(stopped) -> _ => return,
+            recv(notifications) -> _ => lifecycle.notified(Instant::now()),
+            recv(deadline) -> _ => {}
         }
-        // After every message too, so a notification flood cannot starve a due deadline.
-        lifecycle.advance(Instant::now(), &mut system);
+        // After every notification too, so a flood cannot starve a due deadline.
+        lifecycle.advance(Instant::now(), platform);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::super::lifecycle::SETTLE;
+    use super::*;
+
+    /// Refuses the startup check, then blocks every install until released, as a stuck user callback does.
+    struct StuckInstall {
+        installs: u32,
+        entered: channel::Sender<()>,
+        release: channel::Receiver<()>,
     }
 
-    system.tap.shutdown();
-    log::debug!("keyvent: supervisor exited");
+    impl Platform for StuckInstall {
+        fn install(&mut self) -> InstallOutcome {
+            self.installs += 1;
+            if self.installs == 1 {
+                return InstallOutcome::Denied;
+            }
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            // What an install returns once shutdown has closed the shared tap.
+            InstallOutcome::Failed
+        }
+
+        fn probe(&mut self) -> bool {
+            false
+        }
+
+        fn tap_enabled(&self) -> bool {
+            false
+        }
+
+        fn teardown(&mut self) {}
+
+        fn publish(&mut self, _status: Status) {}
+    }
+
+    #[test]
+    fn shutdown_during_a_stuck_install_wins_over_a_pending_notification() {
+        let (entered_tx, entered) = channel::bounded(1);
+        let (release, release_rx) = channel::bounded(0);
+        let (notify, notifications) = channel::bounded(1);
+        let (stop, stopped) = channel::bounded::<Infallible>(0);
+        let (done_tx, done) = channel::bounded(1);
+        thread::spawn(move || {
+            let mut platform = StuckInstall {
+                installs: 0,
+                entered: entered_tx,
+                release: release_rx,
+            };
+            // Started one SETTLE ago, so the retry after the refused startup check is due at once.
+            let lifecycle = Lifecycle::start(Instant::now() - SETTLE, &mut platform);
+            run(lifecycle, &mut platform, &notifications, &stopped);
+            let _ = done_tx.send(());
+        });
+
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the retry never ran");
+        notify.try_send(()).unwrap();
+        drop(stop);
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_millis(500))
+            .expect("the loop kept running after shutdown");
+    }
 }

@@ -22,7 +22,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// Wait between a possible permission change and the check that follows it.
 /// tccd notifies before WindowServer applies a change (at most 47ms later in tests), so a shorter wait could miss a grant.
 /// Each notification restarts the wait, so a burst or a flood yields at most one attempt.
-const SETTLE: Duration = Duration::from_secs(1);
+pub(super) const SETTLE: Duration = Duration::from_secs(1);
 
 pub(super) trait Platform {
     /// Denied leaks a Mach port pair.
