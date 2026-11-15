@@ -38,9 +38,8 @@ pub(crate) struct HookThread {
 }
 
 impl HookThread {
-    /// Spawn the hook thread; returns once the thread has a message queue, so
-    /// a shutdown posted right after can never be lost. The status becomes
-    /// Running once the hook is installed.
+    /// Spawn the hook thread; returns once the hook is installed or has failed, so the status is meaningful.
+    /// The thread has a message queue by then, so a shutdown posted right after can never be lost.
     pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
         let (id_tx, id_rx) = mpsc::channel();
         let worker = Worker::spawn("keyvent-hook", move || {
@@ -89,18 +88,19 @@ fn thread_main(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>, id_tx: 
         let mut msg: MSG = std::mem::zeroed();
         PeekMessageW(&mut msg, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
         HOOK_CTX.with(|c| c.set(&mut ctx));
-        let _ = id_tx.send(GetCurrentThreadId());
+        let thread_id = GetCurrentThreadId();
 
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), null_mut(), 0);
         if hook.is_null() {
-            // No permission dance exists on Windows; failure is not recoverable
-            // here, so the stream simply stays Silent.
+            // Windows has no permission to wait for, so the stream stays Silent.
             log::error!("keyvent: SetWindowsHookEx failed; stream stays silent");
+            let _ = id_tx.send(thread_id);
             return;
         }
         // Seed held state before the first pumped event (see Tracker).
         ctx.tracker.init_from_physical(is_physically_held);
         broadcast.publish(Status::Running);
+        let _ = id_tx.send(thread_id);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}

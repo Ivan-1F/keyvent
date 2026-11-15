@@ -3,12 +3,13 @@
 //! Only tap_create tells whether we may filter keyboard events: in-process permission queries cache stale answers.
 //! A refused tap_create leaks a Mach port pair inside the OS, so asking must be rare while the answer is likely no.
 //!
-//! The policy:
-//! - Running checks once per second, and tears the tap down if the check fails.
-//! - Silent tries to install only for a reason, one `SETTLE` after it: startup, a notification, leaving Running, or a failure unrelated to the permission.
-//! - After a refusal, nothing is tried again until a notification arrives.
+//! The policy: every possible permission change is followed by a check within about a second, and Silent checks nothing else.
+//! - The possible changes are startup, a TCC notification, and leaving Running.
+//! - Running checks once per second anyway, so it ignores notifications, and tears the tap down if a check fails.
+//! - Silent checks one `SETTLE` after a change; after a refusal it waits for the next notification.
+//! - Startup also checks at once, so the caller gets a meaningful status as soon as `start` returns.
+//! - An install that fails for any other reason leaks nothing, so it is simply retried after `SETTLE`.
 //!
-//! Leaving Running always earns one retry, because a grant notification arriving in Running is ignored.
 //! So leaks scale with permission changes, never with uptime.
 
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use crate::Status;
 use super::stream::InstallOutcome;
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
-/// Wait before any install attempt.
+/// Wait between a possible permission change and the check that follows it.
 /// tccd notifies before WindowServer applies a change (at most 47ms later in tests), so a shorter wait could miss a grant.
 /// Each notification restarts the wait, so a burst or a flood yields at most one attempt.
 const SETTLE: Duration = Duration::from_secs(1);
@@ -51,12 +52,16 @@ pub(super) struct Lifecycle {
 }
 
 impl Lifecycle {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
+    /// Check at once, then treat startup like a notification, since it is itself a possible change.
+    pub(super) fn start(now: Instant, platform: &mut impl Platform) -> Self {
+        let mut lifecycle = Self {
             state: State::Silent {
                 attempt_at: Some(now),
             },
-        }
+        };
+        lifecycle.advance(now, platform);
+        lifecycle.notified(now);
+        lifecycle
     }
 
     /// When [`advance`](Self::advance) next has work to do; None if only a notification can change anything.
@@ -86,9 +91,7 @@ impl Lifecycle {
                         }
                     }
                     InstallOutcome::Denied => {
-                        log::debug!(
-                            "keyvent: no Accessibility permission; waiting for a TCC change"
-                        );
+                        log::debug!("keyvent: no Accessibility permission");
                         State::Silent { attempt_at: None }
                     }
                     InstallOutcome::Failed => {
@@ -206,26 +209,26 @@ mod tests {
     }
 
     impl Sim {
-        /// Start the machine with or without the permission, and run its startup attempt.
         fn start(permission: bool) -> Self {
+            Self::start_with_lag(permission, Duration::ZERO)
+        }
+
+        /// Start while WindowServer still reports the opposite of `permission` for `lag`.
+        fn start_with_lag(permission: bool, lag: Duration) -> Self {
             let start = Instant::now();
-            let mut sim = Self {
-                machine: Lifecycle::new(start),
-                os: Fake {
-                    now: start,
-                    permission,
-                    effective_at: start,
-                    tap_enabled: true,
-                    fail_next_install: false,
-                    installed: false,
-                    tap_creates: 0,
-                    refusals: 0,
-                    status: Status::Silent,
-                },
-                start,
+            let mut os = Fake {
+                now: start,
+                permission,
+                effective_at: start + lag,
+                tap_enabled: true,
+                fail_next_install: false,
+                installed: false,
+                tap_creates: 0,
+                refusals: 0,
+                status: Status::Silent,
             };
-            sim.machine.advance(start, &mut sim.os);
-            sim
+            let machine = Lifecycle::start(start, &mut os);
+            Self { machine, os, start }
         }
 
         /// Let `duration` pass, firing every deadline on the way.
@@ -264,12 +267,24 @@ mod tests {
     }
 
     #[test]
-    fn denied_at_start_never_asks_again_without_a_notification() {
+    fn denied_at_start_checks_once_more_then_waits_for_a_notification() {
         let mut sim = Sim::start(false);
         assert_eq!(sim.os.status, Status::Silent);
+        sim.wait(SETTLE);
+        assert_eq!(sim.os.tap_creates, 2);
         assert_eq!(sim.machine.deadline(), None);
         sim.wait(HOUR);
-        assert_eq!(sim.os.tap_creates, 1);
+        assert_eq!(sim.os.tap_creates, 2);
+    }
+
+    /// The host may start us the moment it sees a grant, before WindowServer applies it.
+    #[test]
+    fn startup_racing_a_grant_still_installs() {
+        let mut sim = Sim::start_with_lag(true, 47 * MS);
+        assert_eq!(sim.os.status, Status::Silent);
+        sim.wait(SETTLE);
+        assert_eq!(sim.os.status, Status::Running);
+        assert_eq!(sim.os.refusals, 1);
     }
 
     #[test]
@@ -286,10 +301,12 @@ mod tests {
     #[test]
     fn unrelated_notification_costs_one_refusal() {
         let mut sim = Sim::start(false);
+        sim.wait(SETTLE);
+        assert_eq!(sim.os.refusals, 2);
         sim.notify();
         sim.wait(HOUR);
         assert_eq!(sim.os.status, Status::Silent);
-        assert_eq!(sim.os.refusals, 2);
+        assert_eq!(sim.os.refusals, 3);
     }
 
     #[test]
@@ -422,7 +439,7 @@ mod tests {
 
     /// Random permission changes, notifications, tap disables and quiet periods, checked against three properties.
     /// Liveness: after every quiet period, the status matches what WindowServer allows.
-    /// Leak bound: refusals never exceed startup, plus one per notification, plus two per Running stint.
+    /// Leak bound: refusals never exceed two for startup, plus one per notification, plus two per Running stint.
     /// Quiet: with no inputs and no permission, nothing is ever asked.
     #[test]
     fn randomized_histories_keep_the_invariants() {
@@ -453,7 +470,7 @@ mod tests {
                     stints += 1;
                 }
                 // Stints are counted as they start, so a stint that ends later is already counted.
-                let budget = 1 + notifications + 2 * stints;
+                let budget = 2 + notifications + 2 * stints;
                 assert!(
                     sim.os.refusals <= budget,
                     "seed {seed}: {} refusals over a budget of {budget} after {:?}",

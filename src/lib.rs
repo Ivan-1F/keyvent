@@ -4,7 +4,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! // This will return immediately.
+//! // Returns once the initial status is known, within milliseconds.
 //! let guard = keyvent::start(|event| {
 //!     // Return true to suppress the event system-wide.
 //!     event.key == keyvent::Key::F5
@@ -161,7 +161,7 @@ pub struct Guard {
 /// Start the global event stream.
 ///
 /// ```no_run
-/// // This will return immediately.
+/// // Returns once the initial status is known, within milliseconds.
 /// let guard = keyvent::start(|event| {
 ///     // Return true to suppress the event system-wide.
 ///     event.key == keyvent::Key::F5
@@ -172,6 +172,15 @@ pub struct Guard {
 /// The first call creates the process-wide engine, later calls share it.
 /// Dropping the returned [`Guard`] unregisters this callback, dropping the last
 /// guard stops everything cleanly.
+///
+/// ## Status
+///
+/// When `start` returns, [`Guard::status`] already tells whether events flow.
+/// After a permission change, the status follows within about a second.
+///
+/// A call that has to start the engine blocks until the first check completes: usually under a millisecond, at most tens of milliseconds.
+/// While another guard is alive, the engine is reused and only a call racing its start waits for that check.
+/// In async code, call it from `spawn_blocking`.
 ///
 /// ## Callback
 ///
@@ -200,11 +209,8 @@ pub struct Guard {
 ///
 /// ### macOS
 ///
-/// The process needs to be granted the Accessibility permission (System
-/// Preferences > Privacy & Security > Accessibility)
-/// Without Accessibility permission, the stream simply stays silent; the stream
-/// starts automatically once permission is granted, and stops cleanly on
-/// revocation.
+/// The process needs the Accessibility permission (System Settings > Privacy & Security > Accessibility).
+/// Without it the stream stays silent; it starts automatically once permission is granted, and stops cleanly on revocation.
 pub fn start(callback: impl FnMut(KeyEvent) -> bool + Send + 'static) -> Guard {
     let mut slot = ENGINE.lock().unwrap();
     let engine = match slot.as_ref().and_then(Weak::upgrade) {

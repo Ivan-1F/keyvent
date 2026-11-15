@@ -12,7 +12,7 @@ keyvent = "0.1"
 ## Usage
 
 ```rust
-// This will return immediately.
+// Returns once the initial status is known, within milliseconds.
 let guard = keyvent::start(|event| {
     // Return true to suppress the event system-wide.
     event.key == keyvent::Key::F5
@@ -24,6 +24,5 @@ let guard = keyvent::start(|event| {
 
 ### macOS
 
-The process needs to be granted the Accessibility permission (System Preferences > Privacy & Security > Accessibility)
-
-Without Accessibility permission, the stream simply stays silent; the stream starts automatically once permission is granted, and stops cleanly on revocation.
+The process needs the Accessibility permission (System Settings > Privacy & Security > Accessibility).
+Without it the stream stays silent; it starts automatically once permission is granted, and stops cleanly on revocation.

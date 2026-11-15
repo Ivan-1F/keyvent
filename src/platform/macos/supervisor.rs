@@ -104,18 +104,24 @@ pub(crate) struct Supervisor {
 
 impl Supervisor {
     /// Spawn the tap thread and the supervisor thread that manages it.
+    /// Returns after the first check, so the status is already meaningful.
     pub(crate) fn spawn(callback: BoxedCallback, broadcast: Arc<StatusBroadcast>) -> Self {
         let (inbox, messages) = channel::bounded(INBOX_CAPACITY);
         let shared = Arc::new(SharedTap::new());
         let tap = TapThread::spawn(callback, shared.clone());
-        let system = System {
+        let mut system = System {
             tap,
             shared: shared.clone(),
             broadcast,
         };
+        // Subscribed before the first check, so a change right after it is never missed.
         let tcc_inbox = inbox.clone();
+        let watch = TccWatch::accessibility(move || {
+            let _ = tcc_inbox.try_send(Message::TccChanged);
+        });
+        let lifecycle = Lifecycle::start(Instant::now(), &mut system);
         let worker = Worker::spawn("keyvent-supervisor", move || {
-            supervise(system, messages, tcc_inbox)
+            supervise(system, lifecycle, watch, messages)
         });
         Self {
             inbox,
@@ -136,15 +142,10 @@ impl Supervisor {
 
 fn supervise(
     mut system: System,
+    mut lifecycle: Lifecycle,
+    _watch: Option<TccWatch>,
     messages: channel::Receiver<Message>,
-    tcc_inbox: channel::Sender<Message>,
 ) {
-    // Subscribe before the first install, so a change right after startup is never missed.
-    let _watch = TccWatch::accessibility(move || {
-        let _ = tcc_inbox.try_send(Message::TccChanged);
-    });
-    let mut lifecycle = Lifecycle::new(Instant::now());
-
     loop {
         let received = match lifecycle.deadline() {
             Some(deadline) => messages.recv_deadline(deadline),
