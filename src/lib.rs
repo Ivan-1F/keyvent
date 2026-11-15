@@ -16,12 +16,8 @@
 //!
 //! ## macOS
 //!
-//! The process needs to be granted the Accessibility permission (System
-//! Preferences > Privacy & Security > Accessibility)
-//!
-//! Without Accessibility permission, the stream simply stays silent; the stream
-//! starts automatically once permission is granted, and stops cleanly on
-//! revocation.
+//! The process needs the Accessibility permission (System Settings > Privacy & Security > Accessibility).
+//! Without it the stream stays silent; it starts automatically once permission is granted, and stops cleanly on revocation.
 
 mod cancel;
 mod dispatcher;
@@ -57,22 +53,18 @@ use status::StatusBroadcast;
 pub enum Status {
     /// Events are flowing to the callback.
     Running = 0,
-    /// No event stream is active: no Accessibility permission, permission
-    /// revoked, or the tap was just torn down and is being rebuilt (a brief
-    /// transitional state). Nothing is sent to the callback.
+    /// Nothing reaches the callback.
+    /// On macOS, the Accessibility permission is missing, or the tap is briefly being rebuilt after a fault.
+    /// On Windows, the hook failed to install.
     Silent = 1,
-    /// Reserved for a future rate guard. **Never published by the current
-    /// implementation** — kept in the enum only for API stability. Callers
-    /// must not wait for it.
-    Cooldown = 2,
 }
 
 impl Status {
     pub(crate) fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Status::Running,
-            2 => Status::Cooldown,
-            _ => Status::Silent,
+        if v == Status::Running as u8 {
+            Status::Running
+        } else {
+            Status::Silent
         }
     }
 }
@@ -82,8 +74,7 @@ impl Status {
 static ENGINE: Mutex<Option<Weak<Engine>>> = Mutex::new(None);
 
 /// The process-wide engine: one platform event source, shared by all guards.
-/// Created by the first `start`; dropped — and shut down — when the last
-/// guard drops.
+/// Created by the first `start`; dropped and shut down when the last guard drops.
 struct Engine {
     #[cfg(target_os = "macos")]
     supervisor: Option<Supervisor>,
