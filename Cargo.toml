@@ -1,17 +1,17 @@
 [package]
 name = "keyvent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Global keyboard event stream for macOS, with automatic Accessibility permission lifecycle management"
+description = "Global keyboard events and hotkeys for macOS and Windows, with the macOS Accessibility permission handled for you"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ivan-1F/keyvent"
-keywords = ["hotkey", "keyboard", "macos", "event-tap", "global"]
-categories = ["os::macos-apis", "api-bindings"]
+keywords = ["hotkey", "keyboard", "global", "macos", "windows"]
+categories = ["os::macos-apis", "os::windows-apis"]
 exclude = ["private/"]
 
 [package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 
 [dependencies]
 crossbeam-channel = "0.5"
